@@ -1,0 +1,11 @@
+{
+  "avg_pnl": -0.056739130434782625,
+  "markets": 92,
+  "median_pnl": -0.185,
+  "profit_factor": 0.8450118764845603,
+  "total_early_sell_contracts": 119,
+  "total_early_sell_lost_usd": 15.51,
+  "total_early_sell_saved_usd": 18.87,
+  "total_realized_pnl": -5.2200000000000015,
+  "win_rate": 0.40217391304347827
+}

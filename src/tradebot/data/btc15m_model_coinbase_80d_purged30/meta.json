@@ -1,0 +1,119 @@
+{
+  "created_utc": "2026-01-12T01:30:30.025551+00:00",
+  "feature_names": [
+    "delta",
+    "abs_delta",
+    "return_1m",
+    "return_3m",
+    "return_5m",
+    "vol_5m",
+    "trend_5m",
+    "time_remaining"
+  ],
+  "metrics": {
+    "accuracy": 0.769390932953686,
+    "baselines": {
+      "logreg_delta_time": {
+        "accuracy": 0.7690439115540331,
+        "logloss": 0.654226835710987,
+        "roc_auc": 0.8438666225812512
+      },
+      "majority": {
+        "accuracy": 0.5065622636472839,
+        "base_rate": 0.5065622636472839,
+        "logloss": 0.6930610514788245,
+        "majority_accuracy": 0.5065622636472839,
+        "roc_auc": 0.5
+      }
+    },
+    "calibration": [
+      {
+        "bin_hi": 0.1,
+        "bin_lo": 0.0,
+        "count": 12302.0,
+        "p_mean": 0.034251550079013614,
+        "y_mean": 0.019671598114127786
+      },
+      {
+        "bin_hi": 0.2,
+        "bin_lo": 0.1,
+        "count": 7655.0,
+        "p_mean": 0.1519002244927617,
+        "y_mean": 0.09797517962116264
+      },
+      {
+        "bin_hi": 0.30000000000000004,
+        "bin_lo": 0.2,
+        "count": 10003.0,
+        "p_mean": 0.25253378254949216,
+        "y_mean": 0.20513845846246126
+      },
+      {
+        "bin_hi": 0.4,
+        "bin_lo": 0.30000000000000004,
+        "count": 11821.0,
+        "p_mean": 0.3495507180065524,
+        "y_mean": 0.32357668555959734
+      },
+      {
+        "bin_hi": 0.5,
+        "bin_lo": 0.4,
+        "count": 12389.0,
+        "p_mean": 0.4512055199288102,
+        "y_mean": 0.43966421825813223
+      },
+      {
+        "bin_hi": 0.6000000000000001,
+        "bin_lo": 0.5,
+        "count": 15355.0,
+        "p_mean": 0.5493284692441318,
+        "y_mean": 0.5652881797460111
+      },
+      {
+        "bin_hi": 0.7000000000000001,
+        "bin_lo": 0.6000000000000001,
+        "count": 11354.0,
+        "p_mean": 0.6492992726580996,
+        "y_mean": 0.6838118724678527
+      },
+      {
+        "bin_hi": 0.8,
+        "bin_lo": 0.7000000000000001,
+        "count": 10616.0,
+        "p_mean": 0.748383759806591,
+        "y_mean": 0.7837226827430294
+      },
+      {
+        "bin_hi": 0.9,
+        "bin_lo": 0.8,
+        "count": 8345.0,
+        "p_mean": 0.8490854223450192,
+        "y_mean": 0.9031755542240862
+      },
+      {
+        "bin_hi": 1.0,
+        "bin_lo": 0.9,
+        "count": 12545.0,
+        "p_mean": 0.9649610896042117,
+        "y_mean": 0.9815065763252292
+      }
+    ],
+    "lift_over_majority_accuracy": 0.26282866930640214,
+    "logloss": 0.45894389336938474,
+    "n_val": 112385,
+    "roc_auc": 0.8612979193904291,
+    "split": {
+      "cut_timestamp": 1766829240,
+      "mode": "time_split_purged",
+      "n_train": 449974,
+      "n_val": 112385,
+      "purge_minutes": 30,
+      "train_frac": 0.8
+    }
+  },
+  "note": "Tree models do not require feature normalization.",
+  "train": {
+    "backend": "xgboost",
+    "best_iteration": 795
+  }
+}

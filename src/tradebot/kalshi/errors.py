@@ -1,0 +1,2 @@
+class KalshiError(Exception):
+    pass

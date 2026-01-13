@@ -1,0 +1,16 @@
+httpx>=0.27.0
+cryptography>=42.0.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.1
+tenacity>=8.2.3
+websockets>=12.0
+
+# ML training (btc15m_direction_model)
+numpy>=2.0
+pandas>=2.0
+scikit-learn>=1.5
+xgboost>=3.0
+
+# Analytics dashboard
+streamlit>=1.33
