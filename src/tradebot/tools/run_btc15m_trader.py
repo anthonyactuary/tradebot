@@ -12,7 +12,11 @@ What it does per poll:
 - Place (or dry-run) an order
 
 Run:
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.run_btc15m_trader
+    # From the tradebot/ folder:
+    .\\.venv\\Scripts\\python.exe -m tradebot.tools.run_btc15m_trader
+
+    # Or from the repo root:
+    .\\tradebot\\.venv\\Scripts\\python.exe -m tradebot.tools.run_btc15m_trader
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
@@ -236,6 +241,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Ensure relative paths (src/, runs/) resolve correctly even when invoked from repo root.
+    project_root = Path(__file__).resolve().parents[3]
+    os.chdir(project_root)
 
     # httpx is very chatty at INFO (it logs every request). Keep our app logs at INFO,
     # but silence request spam unless there's a warning/error.

@@ -10,11 +10,11 @@ This module ties together:
 It intentionally does NOT place orders.
 
 Usage (one-shot):
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.btc15m_trade_signal \
+    python -m tradebot.tools.btc15m_trade_signal \
     --model-dir src/tradebot/data/btc15m_model_coinbase_80d_purged30
 
 Usage (live loop):
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.btc15m_trade_signal \
+    python -m tradebot.tools.btc15m_trade_signal \
     --model-dir src/tradebot/data/btc15m_model_coinbase_80d_purged30 --live
 """
 

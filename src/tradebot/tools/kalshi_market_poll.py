@@ -10,7 +10,7 @@ construct ML model inputs:
 It intentionally does not implement trading logic.
 
 Usage (prints JSON snapshots each poll):
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.kalshi_market_poll --live
+    python -m tradebot.tools.kalshi_market_poll --live
 """
 
 from __future__ import annotations

@@ -31,11 +31,11 @@ Outputs
 
 Usage
   # Train from CSV (timestamp, open, high, low, close, volume)
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.btc15m_direction_model \
+    python -m tradebot.tools.btc15m_direction_model \
     --input-csv data/btc_1m.csv --out-dir models/btc15m
 
     # Optional: download Coinbase 1m data (can be slow/rate-limited; may cap history)
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.btc15m_direction_model \
+    python -m tradebot.tools.btc15m_direction_model \
     --download-coinbase --days 180 --out-dir models/btc15m
 """
 

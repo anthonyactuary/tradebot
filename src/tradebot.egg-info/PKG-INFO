@@ -9,3 +9,7 @@ Requires-Dist: pydantic-settings>=2.2.0
 Requires-Dist: python-dotenv>=1.0.1
 Requires-Dist: tenacity>=8.2.3
 Requires-Dist: websockets>=12.0
+Requires-Dist: numpy>=2.0
+Requires-Dist: pandas>=2.0
+Requires-Dist: scikit-learn>=1.5
+Requires-Dist: xgboost>=3.0

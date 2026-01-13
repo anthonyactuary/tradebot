@@ -15,7 +15,7 @@ Notes / mapping
 The feature engineering matches `tradebot.tools.btc15m_direction_model`.
 
 Usage (prints JSON per market per poll):
-  C:/Users/slump/Tradebot/.venv/Scripts/python.exe -m tradebot.tools.btc15m_live_inference \
+    python -m tradebot.tools.btc15m_live_inference \
     --model-dir src/tradebot/data/btc15m_model_coinbase_80d_purged30 --live
 """
 

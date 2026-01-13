@@ -8,6 +8,22 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
+def _default_kalshi_private_key_path() -> str | None:
+    # Default to a repo-local Key.txt if present. This keeps things working if the
+    # project folder is moved within a larger repo.
+    here = __file__
+    try:
+        from pathlib import Path
+
+        project_root = Path(here).resolve().parents[2]
+        candidate = project_root / "Key.txt"
+        if candidate.exists():
+            return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
 class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
@@ -17,7 +33,7 @@ class Settings(BaseSettings):
     kalshi_base_url: str | None = Field(default=None, validation_alias="KALSHI_BASE_URL")
     kalshi_key_id: str | None = Field(default=None, validation_alias="KALSHI_KEY_ID")
     kalshi_private_key_path: str | None = Field(
-        default=None, validation_alias="KALSHI_PRIVATE_KEY_PATH"
+        default_factory=_default_kalshi_private_key_path, validation_alias="KALSHI_PRIVATE_KEY_PATH"
     )
 
     # Bot
