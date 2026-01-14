@@ -5,11 +5,21 @@ import asyncio
 import csv
 import datetime
 import os
+import sys
 import time
 import tempfile
 from pathlib import Path
 from collections import defaultdict
 from typing import Any
+
+# Allow running this file directly ("python analytics/kalshi_activity_report.py") in a
+# src-layout repo by ensuring the src/ root is on sys.path.
+_THIS_FILE = Path(__file__).resolve()
+_SRC_ROOT = _THIS_FILE.parents[1] / "src"  # .../tradebot/src
+if (_SRC_ROOT / "tradebot").is_dir():
+    src_root_str = str(_SRC_ROOT)
+    if src_root_str not in sys.path:
+        sys.path.insert(0, src_root_str)
 
 from tradebot.config import Settings
 from tradebot.kalshi.client import KalshiClient

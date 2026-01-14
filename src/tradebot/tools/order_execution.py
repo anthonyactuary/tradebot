@@ -402,6 +402,7 @@ async def place_order(
     maker_improve_cents: int = 0,
     min_seconds_between_entry_orders: int = 20,
     min_entry_edge: float = 0.025,
+    dead_zone: float = 0.05,
     exit_delta: float = 0.09,
     catastrophic_exit_delta: float = 0.20,
     confirm_entry_fill: bool = True,
@@ -629,6 +630,31 @@ async def place_order(
                             float(min_entry_edge),
                         )
                         return None
+
+    # Dead-zone guardrail: block fresh entries when model is near a coin flip.
+    # Only applies when we are flat (or don't have an inventory snapshot) and we did not flatten in this call.
+    if (
+        not did_flatten
+        and (current_pos_snapshot is None or int(current_pos_snapshot) == 0)
+        and float(dead_zone) > 0.0
+    ):
+        p_side = _p_for_side(edge, side=side)
+        dist = abs(float(p_side) - 0.5)
+        if float(dist) < float(dead_zone):
+            log.info(
+                "DEADZONE_BLOCK %s side=%s p_side=%.4f dist=%.4f < dead_zone=%.4f p_yes=%.4f p_no=%.4f market_yes=%.4f market_no=%.4f ev_after_fees=%.4f",
+                snap.ticker,
+                side,
+                float(p_side),
+                float(dist),
+                float(dead_zone),
+                float(edge.p_yes),
+                float(edge.p_no),
+                float(edge.market_p_yes),
+                float(edge.market_p_no),
+                float(ev_new_side_after_fees),
+            )
+            return None
 
     # Entry gate: don't open fresh positions when model ~= market.
     # This should not prevent exits/flattening.

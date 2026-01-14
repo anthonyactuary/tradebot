@@ -1,0 +1,11 @@
+ts_utc_iso,ts_epoch,level,logger,message,exception
+2026-01-13T22:37:26.987432+00:00,1768343846.987432,INFO,__main__,CSV_LOG enabled path=runs\btc15m_live_20260113_223726.csv,
+2026-01-13T22:37:29.778969+00:00,1768343849.778969,INFO,__main__,BALANCE available=$46.71 portfolio_value=$0.00,
+2026-01-13T22:37:29.830564+00:00,1768343849.830564,INFO,__main__,22:37:29Z  KXBTC15M-26JAN131745-45  tte=7m30s  spot=$95248.14  strike=$95326.30  fee_mode=taker  fee/c=-  p_up=27.53%  mkt=33.00%  EV_yes=-7.47%  EV_no=-0.53%  decision=-  kelly=-  qty=-,
+2026-01-13T22:37:35.772553+00:00,1768343855.772553,INFO,__main__,BALANCE available=$46.71 portfolio_value=$0.00,
+2026-01-13T22:37:35.826678+00:00,1768343855.826678,INFO,__main__,22:37:35Z  KXBTC15M-26JAN131745-45  tte=7m24s  spot=$95230.64  strike=$95326.30  fee_mode=taker  fee/c=$0.0200  p_up=21.35%  mkt=31.00%  EV_yes=-11.65%  EV_no=2.65%  decision=NO  kelly=1.79%  qty=1,
+2026-01-13T22:37:35.827212+00:00,1768343855.827212,INFO,tradebot.tools.order_execution,ORDER KXBTC15M-26JAN131745-45 NO qty=1 @ 74c ($0.74) mode=taker_ioc fee_assumption=taker spot=$95230.64 strike=$95326.30 EV_after_fees=2.649% exp_profit=$0.03 exp_fee_total=$0.02 exp_fee_per_contract=$0.0200 exp_cost=$0.76 tte=444s,
+2026-01-13T22:37:35.880719+00:00,1768343855.880719,INFO,tradebot.tools.order_execution,ORDER_ACK KXBTC15M-26JAN131745-45 side=NO order_id=7eaff15b-e3ca-4fa4-aa54-5e894c3f427a,
+2026-01-13T22:37:42.064135+00:00,1768343862.064135,INFO,__main__,BALANCE available=$46.01 portfolio_value=$0.68,
+2026-01-13T22:37:42.114844+00:00,1768343862.114844,INFO,__main__,22:37:41Z  KXBTC15M-26JAN131745-45  tte=7m18s  spot=$95253.11  strike=$95326.30  fee_mode=taker  fee/c=$0.0200  p_up=27.53%  mkt=35.00%  EV_yes=-9.47%  EV_no=1.47%  decision=NO  kelly=1.12%  qty=0,
+2026-01-13T22:37:44.501201+00:00,1768343864.501201,INFO,__main__,Stopped,

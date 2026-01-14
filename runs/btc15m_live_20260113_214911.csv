@@ -1,0 +1,9 @@
+ts_utc_iso,ts_epoch,level,logger,message,exception
+2026-01-13T21:49:11.716171+00:00,1768340951.716171,INFO,__main__,CSV_LOG enabled path=runs\btc15m_live_20260113_214911.csv,
+2026-01-13T21:49:14.985600+00:00,1768340954.985600,INFO,__main__,BALANCE available=$46.55 portfolio_value=$0.00,
+2026-01-13T21:49:15.038527+00:00,1768340955.038527,INFO,__main__,21:49:14Z  KXBTC15M-26JAN131700-00  tte=10m45s  spot=$94150.12  strike=$94165.14  fee_mode=taker  fee/c=-  p_up=42.20%  mkt=47.00%  EV_yes=-6.80%  EV_no=-1.20%  decision=-  kelly=-  qty=-,
+2026-01-13T21:49:20.858192+00:00,1768340960.858192,INFO,__main__,BALANCE available=$46.55 portfolio_value=$0.00,
+2026-01-13T21:49:20.916561+00:00,1768340960.916561,INFO,__main__,21:49:20Z  KXBTC15M-26JAN131700-00  tte=10m39s  spot=$94154.93  strike=$94165.14  fee_mode=taker  fee/c=-  p_up=45.34%  mkt=47.00%  EV_yes=-3.66%  EV_no=-3.34%  decision=-  kelly=-  qty=-,
+2026-01-13T21:49:26.737765+00:00,1768340966.737765,INFO,__main__,BALANCE available=$46.55 portfolio_value=$0.00,
+2026-01-13T21:49:26.792077+00:00,1768340966.792077,INFO,__main__,21:49:26Z  KXBTC15M-26JAN131700-00  tte=10m33s  spot=$94167.98  strike=$94165.14  fee_mode=taker  fee/c=$0.0200  p_up=52.29%  mkt=50.00%  EV_yes=0.29%  EV_no=-7.29%  decision=YES  kelly=0.46%  qty=0,
+2026-01-13T21:49:31.134893+00:00,1768340971.134893,INFO,__main__,Stopped,

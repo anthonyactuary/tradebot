@@ -25,6 +25,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
@@ -33,6 +34,15 @@ from typing import Literal
 # but silence request spam unless there's a warning/error.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Allow running this file directly ("python path/to/run_btc15m_trader.py") in a
+# src-layout repo by ensuring the src/ root is on sys.path.
+_THIS_FILE = Path(__file__).resolve()
+_SRC_ROOT = _THIS_FILE.parents[2]  # .../src
+if (_SRC_ROOT / "tradebot").is_dir():
+    src_root_str = str(_SRC_ROOT)
+    if src_root_str not in sys.path:
+        sys.path.insert(0, src_root_str)
 
 from tradebot.config import Settings
 from tradebot.kalshi.client import KalshiClient
@@ -96,6 +106,7 @@ class TraderConfig:
     # Execution gates (anti-churn)
     min_hold_seconds: int = 300
     min_entry_edge: float = 0.025
+    dead_zone: float = 0.05
     exit_delta: float = 0.10
     catastrophic_exit_delta: float = 0.18
 
@@ -104,7 +115,6 @@ class TraderConfig:
     max_total_exposure_usd: float | None = 3.0
     max_ticker_abs_contracts: int | None = 3.0
     max_ticker_exposure_usd: float | None = 3.0
-
 
 CONFIG = TraderConfig()
 
@@ -221,6 +231,7 @@ async def _run_once(*, client: KalshiClient, model: object, feature_names: list[
                 maker_improve_cents=int(cfg.maker_improve_cents),
                 min_seconds_between_entry_orders=int(cfg.min_seconds_between_entry_orders),
                 min_entry_edge=float(cfg.min_entry_edge),
+                dead_zone=float(cfg.dead_zone),
                 exit_delta=float(cfg.exit_delta),
                 catastrophic_exit_delta=float(cfg.catastrophic_exit_delta),
                 fee_mode=str(cfg.fee_mode),
