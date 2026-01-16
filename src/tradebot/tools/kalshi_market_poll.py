@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,9 @@ from tradebot.kalshi.orderbook import BestPrices, compute_best_prices
 
 
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+
+
+log = logging.getLogger(__name__)
 
 
 def _utcnow() -> dt.datetime:
@@ -302,6 +306,22 @@ async def fetch_snapshot_for_market(
     )
 
 
+async def _safe_fetch_snapshot_for_market(
+    client: KalshiClient,
+    market: dict[str, Any],
+    *,
+    btc_spot_usd: float | None,
+) -> MarketSnapshot | None:
+    ticker = str(market.get("ticker") or "").strip()
+    try:
+        return await fetch_snapshot_for_market(client, market, btc_spot_usd=btc_spot_usd)
+    except Exception as e:
+        # Treat per-market failures as transient and skip that market for this poll.
+        # This avoids a single bad gateway / timeout from killing the whole bot.
+        log.warning("SNAPSHOT_ERROR ticker=%s error=%s", ticker or "<missing>", e)
+        return None
+
+
 async def poll_once(
     client: KalshiClient,
     *,
@@ -323,9 +343,9 @@ async def poll_once(
         return []
 
     snaps = await asyncio.gather(
-        *(fetch_snapshot_for_market(client, m, btc_spot_usd=btc_spot_usd) for m in markets)
+        *(_safe_fetch_snapshot_for_market(client, m, btc_spot_usd=btc_spot_usd) for m in markets)
     )
-    return list(snaps)
+    return [s for s in snaps if s is not None]
 
 
 def main() -> None:

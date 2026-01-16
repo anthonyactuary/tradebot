@@ -61,6 +61,11 @@ _LAST_ENTRY_BY_TICKER: dict[str, _LastEntry] = {}
 # We keep a per-ticker "no re-entry until" timestamp (epoch seconds).
 _NO_REENTRY_UNTIL_BY_TICKER: dict[str, float] = {}
 
+# If we re-enter immediately after a flip-flatten (decision change), we may want
+# to hold that new position until expiry and never flatten again during the
+# same market.
+_HOLD_TO_EXPIRY_UNTIL_BY_TICKER: dict[str, float] = {}
+
 # Rate-limit repeated entry order attempts per ticker (primarily for maker-only).
 _LAST_ENTRY_ORDER_TS_BY_TICKER: dict[str, float] = {}
 
@@ -82,6 +87,17 @@ _WORKING_ENTRY_ORDER_BY_TICKER: dict[str, _WorkingEntryOrder] = {}
 # our flip path (e.g., manual sell, other strategy/module). This is used to
 # enforce the "no re-entry after flatten" policy.
 _LAST_SEEN_POSITION_BY_TICKER: dict[str, int] = {}
+
+
+@dataclass(frozen=True)
+class _PendingFlipReentry:
+    ts: float
+    from_side: Side
+    to_side: Side
+    until: float
+
+
+_PENDING_FLIP_REENTRY_BY_TICKER: dict[str, _PendingFlipReentry] = {}
 
 
 def _sync_hold_timer_from_inventory(*, snap: MarketSnapshot, position: int) -> None:
@@ -144,6 +160,89 @@ def _mark_no_reentry_until_expiry(*, snap: MarketSnapshot) -> float:
         "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
     )
     return float(until)
+
+
+def _hold_to_expiry_active(*, snap: MarketSnapshot) -> bool:
+    now = time.time()
+    until = _HOLD_TO_EXPIRY_UNTIL_BY_TICKER.get(snap.ticker)
+    if until is None:
+        return False
+    if now >= float(until):
+        _HOLD_TO_EXPIRY_UNTIL_BY_TICKER.pop(snap.ticker, None)
+        return False
+    return True
+
+
+def _mark_hold_to_expiry(*, snap: MarketSnapshot) -> float:
+    """Prevent future flattening for this ticker until expiry."""
+
+    now = time.time()
+    tte: int | None = None
+    if snap.seconds_to_expiry is not None:
+        try:
+            tte = max(0, int(snap.seconds_to_expiry))
+        except Exception:
+            tte = None
+
+    # Safety: keep at least a short lock even if tte is missing/0.
+    min_lock_seconds = 60
+    lock_for = int(tte) if tte is not None else 3600
+    lock_for = max(int(min_lock_seconds), int(lock_for))
+
+    until = now + float(lock_for)
+    _HOLD_TO_EXPIRY_UNTIL_BY_TICKER[snap.ticker] = float(until)
+    log.info(
+        "HOLD_TO_EXPIRY_SET %s until_epoch=%.3f lock_for=%ss tte=%ss",
+        snap.ticker,
+        float(until),
+        str(int(lock_for)),
+        "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
+    )
+    return float(until)
+
+
+def _get_pending_flip_reentry(*, snap: MarketSnapshot) -> _PendingFlipReentry | None:
+    now = time.time()
+    pending = _PENDING_FLIP_REENTRY_BY_TICKER.get(snap.ticker)
+    if pending is None:
+        return None
+    if now >= float(pending.until):
+        _PENDING_FLIP_REENTRY_BY_TICKER.pop(snap.ticker, None)
+        return None
+    return pending
+
+
+def _arm_pending_flip_reentry(*, snap: MarketSnapshot, from_side: Side, to_side: Side) -> _PendingFlipReentry:
+    now = time.time()
+
+    tte: int | None = None
+    if snap.seconds_to_expiry is not None:
+        try:
+            tte = max(0, int(snap.seconds_to_expiry))
+        except Exception:
+            tte = None
+
+    # Keep at least a short window even if tte is missing/0.
+    min_seconds = 60
+    block_for = int(tte) if tte is not None else 3600
+    block_for = max(int(min_seconds), int(block_for))
+
+    pending = _PendingFlipReentry(
+        ts=float(now),
+        from_side=str(from_side),
+        to_side=str(to_side),
+        until=float(now + float(block_for)),
+    )
+    _PENDING_FLIP_REENTRY_BY_TICKER[snap.ticker] = pending
+    log.info(
+        "FLIP_REENTRY_ARMED %s from=%s to=%s until_epoch=%.3f tte=%ss",
+        snap.ticker,
+        str(from_side),
+        str(to_side),
+        float(pending.until),
+        "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
+    )
+    return pending
 
 
 async def _order_has_any_fill(*, client: KalshiClient, order_id: str) -> bool:
@@ -269,6 +368,23 @@ def _held_side_from_position(pos: int) -> Side | None:
 
 def _p_for_side(edge: EdgeResult, *, side: Side) -> float:
     return float(edge.p_yes if side == "YES" else edge.p_no)
+
+
+def _spot_strike_diff_fraction(*, snap: MarketSnapshot) -> float | None:
+    """Return |spot-strike|/spot if both are available."""
+
+    spot = snap.btc_spot_usd
+    strike = snap.price_to_beat
+    if spot is None or strike is None:
+        return None
+    try:
+        spot_f = float(spot)
+        strike_f = float(strike)
+    except Exception:
+        return None
+    if spot_f <= 0 or strike_f <= 0:
+        return None
+    return abs(spot_f - strike_f) / spot_f
 
 
 async def _sell_to_flat(
@@ -405,12 +521,15 @@ async def place_order(
     dead_zone: float = 0.05,
     exit_delta: float = 0.09,
     catastrophic_exit_delta: float = 0.20,
+    allow_reentry_after_flatten: bool = False,
     confirm_entry_fill: bool = True,
     risk_limits: RiskLimits | None = None,
     risk_tickers: list[str] | None = None,
     inventory: InventorySummary | None = None,
     fee_mode: FeeMode = "taker",
     dry_run: bool = True,
+    spot_strike_sanity_enabled: bool = True,
+    max_spot_strike_deviation_fraction: float = 0.02,
     time_in_force: Literal["fill_or_kill", "good_till_canceled", "immediate_or_cancel"] | None = "immediate_or_cancel",
 ) -> PlacedOrder | None:
     """Place a Kalshi order for the trade decision.
@@ -421,6 +540,8 @@ async def place_order(
 
     if decision.side is None:
         return None
+
+    side: Side = "YES" if decision.side == "YES" else "NO"
 
     # Determine current position from the caller-provided inventory snapshot if available.
     # We use this to:
@@ -439,19 +560,37 @@ async def place_order(
         last_pos = _LAST_SEEN_POSITION_BY_TICKER.get(snap.ticker)
         # If we were previously holding and are now flat, enforce no-reentry.
         if last_pos is not None and int(last_pos) != 0 and int(current_pos_snapshot) == 0:
-            _mark_no_reentry_until_expiry(snap=snap)
-            log.info(
-                "FLATTEN_DETECTED %s last_pos=%d now_pos=%d reason=inventory_transition",
-                snap.ticker,
-                int(last_pos),
-                int(current_pos_snapshot),
-            )
+            pending = _get_pending_flip_reentry(snap=snap) if bool(allow_reentry_after_flatten) else None
+            if bool(allow_reentry_after_flatten) and pending is not None:
+                # A flip-flatten may complete asynchronously; don't set the global
+                # no-reentry block in that case.
+                _NO_REENTRY_UNTIL_BY_TICKER.pop(snap.ticker, None)
+                log.info(
+                    "FLATTEN_DETECTED %s last_pos=%d now_pos=%d reason=inventory_transition pending_flip_reentry=true from=%s to=%s",
+                    snap.ticker,
+                    int(last_pos),
+                    int(current_pos_snapshot),
+                    str(pending.from_side),
+                    str(pending.to_side),
+                )
+            else:
+                _mark_no_reentry_until_expiry(snap=snap)
+                log.info(
+                    "FLATTEN_DETECTED %s last_pos=%d now_pos=%d reason=inventory_transition",
+                    snap.ticker,
+                    int(last_pos),
+                    int(current_pos_snapshot),
+                )
         _LAST_SEEN_POSITION_BY_TICKER[snap.ticker] = int(current_pos_snapshot)
+
+    pending = _get_pending_flip_reentry(snap=snap) if bool(allow_reentry_after_flatten) else None
+    flat_now = (current_pos_snapshot is None or int(current_pos_snapshot) == 0)
+    pending_target_ok = bool(pending is not None and flat_now and str(pending.to_side) == str(side))
 
     # If we previously flattened this ticker/market, do not re-enter until expiry.
     # IMPORTANT: only apply this when we're flat; we never want to block exits/flattening
     # due to stale/noisy state.
-    if (current_pos_snapshot is None or int(current_pos_snapshot) == 0) and not re_entry(snap=snap):
+    if flat_now and not re_entry(snap=snap) and not bool(pending_target_ok):
         until = _NO_REENTRY_UNTIL_BY_TICKER.get(snap.ticker)
         log.info(
             "REENTRY_BLOCK %s reason=flattened_prior until_epoch=%.3f tte=%ss",
@@ -461,7 +600,16 @@ async def place_order(
         )
         return None
 
-    side: Side = "YES" if decision.side == "YES" else "NO"
+    # If a pending flip re-entry exists, only allow entry for the intended side.
+    if pending is not None and flat_now and not bool(pending_target_ok):
+        log.info(
+            "PENDING_FLIP_REENTRY_BLOCK %s want=%s pending_to=%s reason=side_mismatch",
+            snap.ticker,
+            str(side),
+            str(pending.to_side),
+        )
+        return None
+
     ev_new_side_after_fees = _ev_after_fees_per_contract(edge, side=side)
 
     qty: int | None = None
@@ -520,6 +668,9 @@ async def place_order(
     # If holding YES and we want NO: sell YES first; then buy NO if flattened.
     # If holding NO and we want YES: sell NO first; then buy YES if flattened.
     did_flatten = False
+    flip_reentry = False
+    flip_from_side: Side | None = None
+    hold_to_expiry_after_entry = False
     base_total_abs_contracts: int | None = None
     base_total_exposure_usd: float | None = None
     current_pos_override: int | None = None
@@ -533,6 +684,19 @@ async def place_order(
         cur_pos = int(ti.position) if ti is not None else 0
         held = _held_side_from_position(cur_pos)
         if held is not None and held != side:
+            flip_from_side = held
+            if _hold_to_expiry_active(snap=snap):
+                until = _HOLD_TO_EXPIRY_UNTIL_BY_TICKER.get(snap.ticker)
+                log.info(
+                    "FLIP_BLOCK %s held=%s want=%s reason=hold_to_expiry until_epoch=%.3f tte=%ss",
+                    snap.ticker,
+                    held,
+                    side,
+                    float(until or 0.0),
+                    "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
+                )
+                return None
+
             # If we have a live position but no hold timer, start it from inventory.
             # This matters most with maker-only entries where fill can occur later.
             _sync_hold_timer_from_inventory(snap=snap, position=int(cur_pos))
@@ -584,6 +748,9 @@ async def place_order(
                     if resp is None:
                         return None
 
+                    if bool(allow_reentry_after_flatten):
+                        _arm_pending_flip_reentry(snap=snap, from_side=held, to_side=side)
+
                     if dry_run:
                         # Simulate flatten for subsequent checks.
                         did_flatten = True
@@ -592,8 +759,9 @@ async def place_order(
                         # If we flattened (even simulated), we are no longer holding the prior side.
                         # Clear any existing hold-timer state for this ticker.
                         _LAST_ENTRY_BY_TICKER.pop(snap.ticker, None)
-                        # And block any re-entry for this ticker until it expires.
-                        _mark_no_reentry_until_expiry(snap=snap)
+                        # Default policy blocks re-entry; optional config allows re-entry after a flip.
+                        if not bool(allow_reentry_after_flatten):
+                            _mark_no_reentry_until_expiry(snap=snap)
                         base_total_abs_contracts = int(
                             inv_for_flip.total_abs_contracts
                             - (ti.abs_contracts if ti is not None else abs(cur_pos))
@@ -614,14 +782,15 @@ async def place_order(
                         current_exposure_override = 0.0
                         # We are flat now; clear any prior hold-timer state for this ticker.
                         _LAST_ENTRY_BY_TICKER.pop(snap.ticker, None)
-                        # And block any re-entry for this ticker until it expires.
-                        _mark_no_reentry_until_expiry(snap=snap)
+                        # Default policy blocks re-entry; optional config allows re-entry after a flip.
+                        if not bool(allow_reentry_after_flatten):
+                            _mark_no_reentry_until_expiry(snap=snap)
                         base_total_abs_contracts = int(inv2.total_abs_contracts)
                         base_total_exposure_usd = float(inv2.total_exposure_usd)
 
-                    # Policy: after we flatten a market, do not place any further orders
-                    # (including re-entry) until the next market/ticker.
-                    if did_flatten:
+                    # Policy: default is flatten-only (no re-entry). If enabled, allow re-entry
+                    # after flip-flatten and then hold that new position until expiry.
+                    if did_flatten and not bool(allow_reentry_after_flatten):
                         log.info(
                             "FLATTEN_ONLY %s want=%s reason=no_reentry_after_flatten ev_after_fees=%.4f min_entry_edge=%.4f",
                             snap.ticker,
@@ -631,10 +800,41 @@ async def place_order(
                         )
                         return None
 
+                    if did_flatten and bool(allow_reentry_after_flatten):
+                        # Ensure any stale no-reentry state does not block this re-entry.
+                        _NO_REENTRY_UNTIL_BY_TICKER.pop(snap.ticker, None)
+                        hold_to_expiry_after_entry = True
+                        flip_reentry = True
+
+    allow_entry_post_flatten = bool(did_flatten and allow_reentry_after_flatten and hold_to_expiry_after_entry)
+
+    # If flatten completed in a prior poll and we're now flat, honor pending flip re-entry.
+    if pending is not None and flat_now and bool(pending_target_ok) and not bool(_hold_to_expiry_active(snap=snap)):
+        hold_to_expiry_after_entry = True
+        flip_reentry = True
+        flip_from_side = pending.from_side
+
+    # Sanity gate: if the API is returning an obviously bad strike early in the market,
+    # block entry orders to avoid trading on bad data.
+    if bool(spot_strike_sanity_enabled) and float(max_spot_strike_deviation_fraction) > 0:
+        diff = _spot_strike_diff_fraction(snap=snap)
+        if diff is not None and float(diff) > float(max_spot_strike_deviation_fraction):
+            log.warning(
+                "SPOT_STRIKE_BLOCK %s side=%s spot=%s strike=%s diff_pct=%.2f > max_pct=%.2f strike_src=%s",
+                snap.ticker,
+                str(side),
+                _fmt_usd(snap.btc_spot_usd),
+                _fmt_usd(snap.price_to_beat),
+                float(diff) * 100.0,
+                float(max_spot_strike_deviation_fraction) * 100.0,
+                str(snap.price_to_beat_source or "?"),
+            )
+            return None
+
     # Dead-zone guardrail: block fresh entries when model is near a coin flip.
-    # Only applies when we are flat (or don't have an inventory snapshot) and we did not flatten in this call.
+    # Applies when we are flat (or don't have an inventory snapshot).
     if (
-        not did_flatten
+        (not did_flatten or allow_entry_post_flatten)
         and (current_pos_snapshot is None or int(current_pos_snapshot) == 0)
         and float(dead_zone) > 0.0
     ):
@@ -657,8 +857,8 @@ async def place_order(
             return None
 
     # Entry gate: don't open fresh positions when model ~= market.
-    # This should not prevent exits/flattening.
-    if not did_flatten and float(ev_new_side_after_fees) <= float(min_entry_edge):
+    # Applies to opening/adding positions; does not apply to flattening.
+    if (not did_flatten or allow_entry_post_flatten) and float(ev_new_side_after_fees) <= float(min_entry_edge):
         log.info(
             "ENTRY_BLOCK %s side=%s ev_after_fees=%.4f <= min_entry_edge=%.4f",
             snap.ticker,
@@ -829,6 +1029,18 @@ async def place_order(
 
     expected_cost_usd = float(entry_price_dollars) * float(qty) + float(fee_total_usd)
 
+    if bool(flip_reentry):
+        log.info(
+            "REENTRY_AFTER_FLATTEN %s from=%s to=%s qty=%d @ %dc EV_after_fees=%.4f min_entry_edge=%.4f hold_to_expiry=true",
+            snap.ticker,
+            "?" if flip_from_side is None else str(flip_from_side),
+            str(side),
+            int(qty),
+            int(entry_price_cents),
+            float(ev_per_contract),
+            float(min_entry_edge),
+        )
+
     log.info(
         "ORDER %s %s qty=%d @ %dc ($%.2f) mode=%s fee_assumption=%s spot=%s strike=%s EV_after_fees=%.3f%% exp_profit=$%.2f exp_fee_total=$%.2f exp_fee_per_contract=$%.4f exp_cost=$%.2f tte=%ss",
         snap.ticker,
@@ -855,6 +1067,9 @@ async def place_order(
             _OPEN_ENTRY_ORDER_ID_BY_TICKER[snap.ticker] = str(
                 f"dry-open-{snap.ticker}-{int(time.time()*1000)}"
             )
+        if bool(hold_to_expiry_after_entry):
+            _mark_hold_to_expiry(snap=snap)
+            _PENDING_FLIP_REENTRY_BY_TICKER.pop(snap.ticker, None)
         return PlacedOrder(
             ticker=snap.ticker,
             side=side,
@@ -922,6 +1137,12 @@ async def place_order(
 
     order_id = _extract_order_id(resp)
     log.info("ORDER_ACK %s side=%s order_id=%s", snap.ticker, side, order_id or "?")
+
+    # If this entry was a re-entry right after a flip-flatten, lock the ticker
+    # to hold until expiry so we never flatten this new position.
+    if bool(hold_to_expiry_after_entry):
+        _mark_hold_to_expiry(snap=snap)
+        _PENDING_FLIP_REENTRY_BY_TICKER.pop(snap.ticker, None)
 
     # Track open maker entry order id so future attempts cancel/replace instead of stacking.
     if str(entry_mode) == "maker_only" and order_id:

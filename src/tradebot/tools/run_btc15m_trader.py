@@ -71,7 +71,7 @@ class TraderConfig:
     asset: str = "BTC"
     horizon_minutes: int = 60
     limit_markets: int = 2
-    min_seconds_to_expiry: int = 60
+    min_seconds_to_expiry: int = 30
 
     # Signal
     fee_mode: FeeMode = "taker"
@@ -110,11 +110,23 @@ class TraderConfig:
     exit_delta: float = 0.10
     catastrophic_exit_delta: float = 0.18
 
+    # Data sanity
+    # Block entry orders if Kalshi strike is too far from external spot (helps when
+    # strike is briefly wrong early in a market).
+    spot_strike_sanity_enabled: bool = True
+    max_spot_strike_deviation_fraction: float = 0.02
+
+    # Re-entry policy
+    # Default behavior is: after flatten, do not re-enter in the same ticker.
+    # If enabled, a flip-flatten (decision change) may immediately re-enter the opposite side,
+    # and that re-entry position will be held until expiry (no further flawttening).
+    allow_reentry_after_flatten: bool = True
+
     # Risk limits (set to None to disable a specific limit)
-    max_total_abs_contracts: int | None = 3.0
-    max_total_exposure_usd: float | None = 3.0
-    max_ticker_abs_contracts: int | None = 3.0
-    max_ticker_exposure_usd: float | None = 3.0
+    max_total_abs_contracts: int | None = 5.0
+    max_total_exposure_usd: float | None = 5.0
+    max_ticker_abs_contracts: int | None = 5.0
+    max_ticker_exposure_usd: float | None = 5.0
 
 CONFIG = TraderConfig()
 
@@ -132,13 +144,18 @@ def _trade_ev_after_fees(signal: TradeSignal) -> float | None:
 
 
 async def _run_once(*, client: KalshiClient, model: object, feature_names: list[str], cfg: TraderConfig) -> None:
-    snaps: list[MarketSnapshot] = await poll_once(
-        client,
-        asset=str(cfg.asset),
-        horizon_minutes=int(cfg.horizon_minutes),
-        limit_markets=int(cfg.limit_markets),
-        min_seconds_to_expiry=int(cfg.min_seconds_to_expiry),
-    )
+    try:
+        snaps: list[MarketSnapshot] = await poll_once(
+            client,
+            asset=str(cfg.asset),
+            horizon_minutes=int(cfg.horizon_minutes),
+            limit_markets=int(cfg.limit_markets),
+            min_seconds_to_expiry=int(cfg.min_seconds_to_expiry),
+        )
+    except Exception as e:
+        # Kalshi occasionally returns transient 5xx. Don't let one poll kill the bot.
+        log.warning("POLL_ONCE_ERROR error=%s", e)
+        return
 
     if not snaps:
         log.info("No active markets found")
@@ -234,8 +251,11 @@ async def _run_once(*, client: KalshiClient, model: object, feature_names: list[
                 dead_zone=float(cfg.dead_zone),
                 exit_delta=float(cfg.exit_delta),
                 catastrophic_exit_delta=float(cfg.catastrophic_exit_delta),
+                allow_reentry_after_flatten=bool(cfg.allow_reentry_after_flatten),
                 fee_mode=str(cfg.fee_mode),
                 dry_run=bool(cfg.dry_run),
+                spot_strike_sanity_enabled=bool(cfg.spot_strike_sanity_enabled),
+                max_spot_strike_deviation_fraction=float(cfg.max_spot_strike_deviation_fraction),
                 time_in_force=cfg.time_in_force,
                 risk_limits=risk_limits,
                 risk_tickers=tickers,
@@ -286,7 +306,10 @@ def main() -> None:
                     if (_utcnow().timestamp() - start) >= float(CONFIG.duration_seconds):
                         break
 
-                await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG)
+                try:
+                    await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG)
+                except Exception:
+                    log.exception("RUN_ONCE_ERROR")
                 await asyncio.sleep(max(0.1, float(CONFIG.poll_seconds)))
         finally:
             await client.aclose()

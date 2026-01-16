@@ -63,12 +63,82 @@ def _clamp_price_cents(v: float | int) -> int:
 	return max(1, min(99, int(c)))
 
 
-def _max_count_for_action(*, pos: int, max_abs_pos: int, action: str) -> int:
+def _clamp_z(v: float) -> float:
+	try:
+		x = float(v)
+	except Exception:
+		x = 0.0
+	if not math.isfinite(x):
+		x = 0.0
+	return float(max(-1.0, min(1.0, x)))
+
+
+def _extract_price_cents(v: object) -> int | None:
+	"""Extract a Kalshi price in cents from common response shapes.
+
+	Handles:
+	- int/float/str ("64", 64, 64.0)
+	- dict wrappers like {"cents": 64}, {"value": 64}, {"price": {"cents": 64}}
+	- single-element containers like [64]
+
+	If a numeric value looks like dollars (0 < x <= 1.0), converts to cents.
+	Returns None if no parseable value is found.
+	"""
+	if v is None:
+		return None
+	# Avoid treating bool as int.
+	if isinstance(v, bool):
+		return None
+
+	if isinstance(v, (int, float)):
+		x = float(v)
+		if not math.isfinite(x):
+			return None
+		if 0.0 < x <= 1.0:
+			return int(round(x * 100.0))
+		return int(round(x))
+
+	if isinstance(v, str):
+		s = v.strip()
+		if not s:
+			return None
+		# Strip a trailing 'c' if present (e.g., "64c").
+		if s.lower().endswith("c"):
+			s = s[:-1].strip()
+		# Strip a leading '$' if present.
+		if s.startswith("$"):
+			s = s[1:].strip()
+		try:
+			x = float(s)
+		except Exception:
+			return None
+		if not math.isfinite(x):
+			return None
+		if 0.0 < x <= 1.0:
+			return int(round(x * 100.0))
+		return int(round(x))
+
+	if isinstance(v, dict):
+		# Common nested keys.
+		for k in ("cents", "cent", "value", "price", "amount"):
+			if k in v:
+				return _extract_price_cents(v.get(k))
+		return None
+
+	if isinstance(v, (list, tuple)) and len(v) == 1:
+		return _extract_price_cents(v[0])
+
+	return None
+
+
+def _max_count_for_action(*, pos: int, max_abs_pos: int, action: str, instrument: str = "yes") -> int:
 	"""Max count such that resulting |pos'| <= max_abs_pos.
 
-Position convention matches `inventory_check` / `order_execution`:
+Position convention matches `inventory_check` / `order_execution` (signed):
 	buy YES  -> pos += count
 	sell YES -> pos -= count
+	buy NO   -> pos -= count
+	sell NO  -> pos += count
 
 We implement market making by quoting YES book only.
 """
@@ -78,11 +148,30 @@ We implement market making by quoting YES book only.
 	if max_abs_pos <= 0:
 		return 0
 
-	if action == "buy":
+	inst = str(instrument).lower().strip()
+	act = str(action).lower().strip()
+	if inst not in {"yes", "no"}:
+		inst = "yes"
+	if act not in {"buy", "sell"}:
+		act = "buy"
+
+	# Signed delta per contract.
+	# YES: buy => +1, sell => -1
+	# NO:  buy => -1, sell => +1
+	delta = 0
+	if inst == "yes" and act == "buy":
+		delta = +1
+	elif inst == "yes" and act == "sell":
+		delta = -1
+	elif inst == "no" and act == "buy":
+		delta = -1
+	else:  # inst == "no" and act == "sell"
+		delta = +1
+
+	if int(delta) > 0:
 		# pos' = pos + c => c <= max_abs_pos - pos
 		return max(0, int(max_abs_pos - pos))
-
-	# action == "sell"
+	# delta < 0
 	# pos' = pos - c => c <= pos + max_abs_pos
 	return max(0, int(pos + max_abs_pos))
 
@@ -123,6 +212,29 @@ def _is_post_only_cross_error(exc: BaseException) -> bool:
 	return "post only cross" in s or "post_only_cross" in s
 
 
+def _derive_no_from_yes_book(*, best_yes_bid: int | None, best_yes_ask: int | None) -> tuple[int | None, int | None]:
+	"""Derive NO best bid/ask from YES best bid/ask via complement mapping.
+
+	On Kalshi, YES and NO are complementary ($YES + $NO = $1 payoff). In cents:
+	- best_no_bid = 100 - best_yes_ask
+	- best_no_ask = 100 - best_yes_bid
+	"""
+	best_no_bid = None if best_yes_ask is None else int(max(1, min(99, 100 - int(best_yes_ask))))
+	best_no_ask = None if best_yes_bid is None else int(max(1, min(99, 100 - int(best_yes_bid))))
+	return best_no_bid, best_no_ask
+
+
+def _derive_no_quotes_from_yes_quotes(
+	*,
+	yes_bid_cents: int | None,
+	yes_ask_cents: int | None,
+) -> tuple[int | None, int | None]:
+	"""Return (no_bid, no_ask) that are complementary to (yes_ask, yes_bid)."""
+	no_bid = None if yes_ask_cents is None else int(max(1, min(99, 100 - int(yes_ask_cents))))
+	no_ask = None if yes_bid_cents is None else int(max(1, min(99, 100 - int(yes_bid_cents))))
+	return no_bid, no_ask
+
+
 @dataclass(frozen=True)
 class MarketMakerConfig:
 	model_dir: str
@@ -131,14 +243,14 @@ class MarketMakerConfig:
 	asset: str = "BTC"
 	horizon_minutes: int = 600
 	limit_markets: int = 1
-	min_seconds_to_expiry: int = 30
+	min_seconds_to_expiry: int = 90
 	poll_interval_sec: float = 2
 	duration_sec: float = 0.0
 
 	# Quoting / spread shaping
-	base_spread_cents: int = 6
-	min_spread_cents: int = 5
-	max_spread_cents: int = 20
+	base_spread_cents: int = 10
+	min_spread_cents: int = 8
+	max_spread_cents: int = 25
 
 	# Direction / regime
 	one_sided_threshold: float = 0.60
@@ -146,28 +258,34 @@ class MarketMakerConfig:
 	deadzone_neutral_low: float = 0.45
 	deadzone_neutral_high: float = 0.55
 
+	# Trend protection (asymmetric quoting around a skewed mid)
+	trend_z_denom: float = 0.12  # z = clamp((p-0.5)/denom, -1, 1)
+	mid_skew_cents: float = 1.0
+	wrongway_extra_cents: float = 6.0
+	size_reduce: float = 0.75
+
 	# Momentum pause
-	momentum_pause_abs_return_1m: float = 0.0015
-	momentum_pause_seconds: int = 10
+	momentum_pause_abs_return_1m: float = 0.0010
+	momentum_pause_seconds: int = 15
 
 	# Expiry controls
 	force_widen_tte_sec: int = 120
-	force_stop_tte_sec: int = 30
+	force_stop_tte_sec: int = 60
 
 	# Order placement
-	quote_size: int = 10
+	quote_size: int = 1
 	post_only: bool = True
 	time_in_force: str = "good_till_canceled"
 	dry_run: bool = False
-	min_quote_refresh_seconds: int = 2
+	min_quote_refresh_seconds: int = 5
 	cancel_before_replace: bool = True
 
 	# Inventory controls
-	max_abs_pos: int = 25
-	inventory_soft_limit: int = 10
-	inventory_hard_limit: int = 20
-	inventory_skew_cents_per_contract: float = 0.5
-	inventory_skew_quadratic: bool = True
+	max_abs_pos: int = 5
+	inventory_soft_limit: int = 4
+	inventory_hard_limit: int = 6
+	inventory_skew_cents_per_contract: float = 0.3
+	inventory_skew_quadratic: bool = False
 
 	# Monitoring
 	monitor_interval_sec: float = 30.0
@@ -197,6 +315,8 @@ class KalshiMarketMaker:
 		self._last_quote_ts_by_ticker: dict[str, float] = {}
 		self._last_desired_quote_by_ticker: dict[str, tuple[int | None, int | None]] = {}
 		self._last_block_log_by_ticker: dict[str, tuple[str, float]] = {}
+		self._warned_book_swap: bool = False
+		self._dumped_fill_ids: set[str] = set()
 
 	def _tickers_to_monitor(self) -> list[str]:
 		# Union of tickers we're currently quoting and tickers we've recently polled.
@@ -247,19 +367,53 @@ class KalshiMarketMaker:
 						action = str(f.get("action") or "")
 						side = str(f.get("side") or "")
 						count = int(f.get("count") or 0)
-						price_cents = int(f.get("price") or 0)
 						is_taker = f.get("is_taker")
 						created_time = f.get("created_time")
-						sign = 1.0 if action == "sell" else -1.0
-						cashflow_usd = sign * (float(count) * float(price_cents) / 100.0)
+						fill_id = str(f.get("fill_id") or "").strip()
+
+						# Robust price extraction: Kalshi fills may include yes_price/no_price or price.
+						price_cents = None
+						price_field = None
+						try:
+							side_l = side.lower().strip()
+						except Exception:
+							side_l = ""
+						if side_l == "yes" and f.get("yes_price") is not None:
+							price_field = "yes_price"
+							price_cents = _extract_price_cents(f.get("yes_price"))
+						elif side_l == "no" and f.get("no_price") is not None:
+							price_field = "no_price"
+							price_cents = _extract_price_cents(f.get("no_price"))
+						elif f.get("price") is not None:
+							price_field = "price"
+							price_cents = _extract_price_cents(f.get("price"))
+
+						if price_cents is not None and int(price_cents) == 0:
+							# Prove correctness: dump raw fill once if 0 shows up.
+							if fill_id and fill_id not in self._dumped_fill_ids:
+								log.warning("MM_FILL_PRICE_ZERO raw_fill=%s", str(f))
+								self._dumped_fill_ids.add(fill_id)
+
+						cashflow_str = "-"
+						if price_cents is not None and int(price_cents) > 0:
+							sign = 1.0 if action == "sell" else -1.0
+							cashflow_usd = sign * (float(count) * float(price_cents) / 100.0)
+							cashflow_str = f"{cashflow_usd:+.2f}"
+						else:
+							# Don't pretend missing price is 0.
+							if fill_id and fill_id not in self._dumped_fill_ids:
+								log.warning("MM_FILL_PRICE_MISSING fields=%s raw_fill=%s", str(list(f.keys())), str(f))
+								self._dumped_fill_ids.add(fill_id)
+
 						log.info(
-							"MM_FILL %s action=%s side=%s count=%d price=%dc cashflow=%+.2f is_taker=%s ts=%s",
+							"MM_FILL %s action=%s side=%s count=%d price=%s(%s) cashflow=%s is_taker=%s ts=%s",
 							ticker,
 							action,
 							side,
 							int(count),
-							int(price_cents),
-							float(cashflow_usd),
+							"-" if price_cents is None else f"{int(price_cents)}c",
+							"-" if price_field is None else str(price_field),
+							str(cashflow_str),
 							str(is_taker),
 							str(created_time),
 						)
@@ -425,6 +579,221 @@ class KalshiMarketMaker:
 			return True, False, "tilt_buy"
 		return False, True, "tilt_sell"
 
+	def _compute_trend_z(self, *, p_yes: float) -> float:
+		den = float(self.cfg.trend_z_denom)
+		if not math.isfinite(den) or den <= 0:
+			den = 0.1
+		z = (float(p_yes) - 0.5) / float(den)
+		return _clamp_z(float(z))
+
+	def _normalize_best_books(
+		self,
+		*,
+		snap: MarketSnapshot,
+		yes_fair_cents: int,
+	) -> tuple[int | None, int | None, int | None, int | None]:
+		"""Return normalized (best_yes_bid, best_yes_ask, best_no_bid, best_no_ask).
+
+		BUG FIX NOTE:
+		We observed impossible behavior like p_yes=0.96 (fair ~96c) but quotes clamped to ~10c.
+		That can only happen if we clamp YES prices using NO best bid/ask (or vice versa).
+		Because `MarketSnapshot` may not reliably label which side its best bid/ask refers to,
+		we pick the interpretation that best respects complement parity using BOTH books:
+		- YES ask + NO bid ≈ 100
+		- YES bid + NO ask ≈ 100
+		We compare as-is labeling vs swapped labeling and choose the smallest parity error.
+		If parity is unavailable (missing values), we fall back to closeness-to-fair on the YES mid.
+		"""
+		raw_yes_bid = snap.best_yes_bid
+		raw_yes_ask = snap.best_yes_ask
+		raw_no_bid = getattr(snap, "best_no_bid", None)
+		raw_no_ask = getattr(snap, "best_no_ask", None)
+
+		def _clamp_book(v: int | None) -> int | None:
+			if v is None:
+				return None
+			try:
+				return int(max(1, min(99, int(v))))
+			except Exception:
+				return None
+
+		raw_yes_bid = _clamp_book(raw_yes_bid)
+		raw_yes_ask = _clamp_book(raw_yes_ask)
+		raw_no_bid = _clamp_book(raw_no_bid)
+		raw_no_ask = _clamp_book(raw_no_ask)
+		yf = int(max(1, min(99, int(yes_fair_cents))))
+
+		def _mid(bid: int | None, ask: int | None) -> float | None:
+			if bid is not None and ask is not None:
+				return 0.5 * (float(bid) + float(ask))
+			if bid is not None:
+				return float(bid)
+			if ask is not None:
+				return float(ask)
+			return None
+
+		def _score_yes_book(yes_bid: int | None, yes_ask: int | None) -> float:
+			m = _mid(yes_bid, yes_ask)
+			if m is None:
+				return 1e9
+			d = abs(float(m) - float(yf))
+			# Small penalty for missing one side to avoid overconfidence.
+			if yes_bid is None or yes_ask is None:
+				d += 2.0
+			return float(d)
+
+		def _parity_error(
+			*,
+			yes_bid: int | None,
+			yes_ask: int | None,
+			no_bid: int | None,
+			no_ask: int | None,
+		) -> float:
+			err = 0.0
+			have = 0
+			if yes_ask is not None and no_bid is not None:
+				err += abs(float(int(yes_ask) + int(no_bid) - 100))
+				have += 1
+			if yes_bid is not None and no_ask is not None:
+				err += abs(float(int(yes_bid) + int(no_ask) - 100))
+				have += 1
+			# Penalize missing parity constraints.
+			if have == 0:
+				return 1e9
+			if have == 1:
+				err += 5.0
+			# Penalize obviously invalid books.
+			if yes_bid is not None and yes_ask is not None and int(yes_bid) >= int(yes_ask):
+				err += 25.0
+			if no_bid is not None and no_ask is not None and int(no_bid) >= int(no_ask):
+				err += 25.0
+			return float(err)
+
+		# Interpretation A: as-is labeling.
+		yes_bid_a, yes_ask_a = raw_yes_bid, raw_yes_ask
+		no_bid_a, no_ask_a = raw_no_bid, raw_no_ask
+		par_a = _parity_error(yes_bid=yes_bid_a, yes_ask=yes_ask_a, no_bid=no_bid_a, no_ask=no_ask_a)
+
+		# Interpretation B: swapped labeling (snapshot YES fields are actually NO and vice versa).
+		yes_bid_b, yes_ask_b = raw_no_bid, raw_no_ask
+		no_bid_b, no_ask_b = raw_yes_bid, raw_yes_ask
+		par_b = _parity_error(yes_bid=yes_bid_b, yes_ask=yes_ask_b, no_bid=no_bid_b, no_ask=no_ask_b)
+
+		use_b = False
+		if par_a < 1e8 or par_b < 1e8:
+			# Deterministic parity-first selection.
+			use_b = bool(par_b + 0.01 < par_a)
+			if not use_b and not (par_a + 0.01 < par_b):
+				# Tie-breaker: pick the one whose YES mid is closer to fair.
+				score_a = _score_yes_book(yes_bid_a, yes_ask_a)
+				score_b = _score_yes_book(yes_bid_b, yes_ask_b)
+				use_b = bool(score_b + 0.01 < score_a)
+		else:
+			# If parity unavailable, fall back to fair-distance selection.
+			score_a = _score_yes_book(yes_bid_a, yes_ask_a)
+			score_b = _score_yes_book(yes_bid_b, yes_ask_b)
+			use_b = bool(score_b + 0.5 < score_a)
+
+		if use_b:
+			if not self._warned_book_swap:
+				log.warning(
+					"MM_BOOK_SWAP_HEURISTIC using swapped YES/NO labeling yes_fair=%dc parity_a=%.2f parity_b=%.2f raw_yes=%s/%s raw_no=%s/%s",
+					int(yf),
+					float(par_a),
+					float(par_b),
+					str(snap.best_yes_bid),
+					str(snap.best_yes_ask),
+					str(getattr(snap, "best_no_bid", None)),
+					str(getattr(snap, "best_no_ask", None)),
+				)
+				self._warned_book_swap = True
+			return yes_bid_b, yes_ask_b, no_bid_b, no_ask_b
+
+		return yes_bid_a, yes_ask_a, no_bid_a, no_ask_a
+
+	def _price_mapping_sanity_check(
+		self,
+		*,
+		ticker: str,
+		p_yes: float,
+		yes_bid_cents: int | None,
+		yes_ask_cents: int | None,
+		no_bid_cents: int | None,
+		no_ask_cents: int | None,
+		spread_cents: int,
+		invert_margin_cents: int = 5,
+		snap: MarketSnapshot,
+	) -> bool:
+		"""Detect YES/NO mapping mistakes (e.g., quoting near NO fair while sending YES orders)."""
+		yes_fair = int(round(float(p_yes) * 100.0))
+		yes_fair = int(max(1, min(99, yes_fair)))
+		no_fair = int(100 - yes_fair)
+		no_fair = int(max(1, min(99, no_fair)))
+		# This is an inversion detector, not a general mispricing detector.
+		# Keep allow tight: mostly driven by spread.
+		allow = int(max(8, int(spread_cents) + 2))
+		margin = int(max(1, int(invert_margin_cents)))
+
+		def _bad(price: int, fair: int, other_fair: int) -> bool:
+			p = int(price)
+			df = abs(p - int(fair))
+			do = abs(p - int(other_fair))
+			# Strong inversion signal: materially closer to the opposite fair.
+			if do + int(margin) <= df:
+				return True
+			# Soft inversion signal: far from intended fair AND closer to the opposite fair.
+			if df > int(allow) and do < df:
+				return True
+			# Extreme fair guardrails: prevents p≈0.96 producing YES quotes near 10c.
+			if int(fair) >= 80 and p < 60:
+				return True
+			if int(fair) <= 20 and p > 40:
+				return True
+			return False
+
+		bad = False
+		bad_fields: list[str] = []
+		if yes_bid_cents is not None and _bad(int(yes_bid_cents), yes_fair, no_fair):
+			bad = True
+			bad_fields.append("yes_bid")
+		if yes_ask_cents is not None and _bad(int(yes_ask_cents), yes_fair, no_fair):
+			bad = True
+			bad_fields.append("yes_ask")
+		if no_bid_cents is not None and _bad(int(no_bid_cents), no_fair, yes_fair):
+			bad = True
+			bad_fields.append("no_bid")
+		if no_ask_cents is not None and _bad(int(no_ask_cents), no_fair, yes_fair):
+			bad = True
+			bad_fields.append("no_ask")
+
+		if not bad:
+			return True
+
+		best_yes_bid, best_yes_ask, best_no_bid, best_no_ask = self._normalize_best_books(
+			snap=snap,
+			yes_fair_cents=int(yes_fair),
+		)
+		log.error(
+			"MM_PRICE_MAP_ERROR %s bad=%s p_yes=%.3f allow=%dc margin=%dc spread=%dc yes_fair=%dc no_fair=%dc yes_bid=%s yes_ask=%s no_bid=%s no_ask=%s best_yes_bid=%s best_yes_ask=%s best_no_bid=%s best_no_ask=%s",
+			str(ticker),
+			"|".join(bad_fields),
+			float(p_yes),
+			int(allow),
+			int(margin),
+			int(spread_cents),
+			int(yes_fair),
+			int(no_fair),
+			"-" if yes_bid_cents is None else str(int(yes_bid_cents)),
+			"-" if yes_ask_cents is None else str(int(yes_ask_cents)),
+			"-" if no_bid_cents is None else str(int(no_bid_cents)),
+			"-" if no_ask_cents is None else str(int(no_ask_cents)),
+			"-" if best_yes_bid is None else str(int(best_yes_bid)),
+			"-" if best_yes_ask is None else str(int(best_yes_ask)),
+			"-" if best_no_bid is None else str(int(best_no_bid)),
+			"-" if best_no_ask is None else str(int(best_no_ask)),
+		)
+		return False
+
 	def _compute_inventory_skew_cents(self, *, pos: int) -> int:
 		k = abs(int(pos))
 		if k <= 0:
@@ -509,13 +878,15 @@ class KalshiMarketMaker:
 			return True
 		return False
 
-	async def get_fair_prob_yes(self, snap: MarketSnapshot) -> float:
+	async def get_fair_prob_yes(self, snap: MarketSnapshot, *, closes_1m: list[float] | None = None) -> float:
 		"""Return model fair P(YES) in [0, 1] for this market snapshot."""
 
 		if snap.price_to_beat is None or snap.btc_spot_usd is None or snap.seconds_to_expiry is None:
 			raise ValueError("missing snap fields")
 
-		closes = await fetch_recent_1m_closes(limit=6)
+		closes = closes_1m
+		if closes is None:
+			closes = await fetch_recent_1m_closes(limit=6)
 		feats = build_feature_dict(
 			price_to_beat=float(snap.price_to_beat),
 			btc_spot_usd=float(snap.btc_spot_usd),
@@ -524,8 +895,14 @@ class KalshiMarketMaker:
 		)
 		return float(predict_probability(self.model, self.feature_names, feats))
 
-	async def get_position(self, ticker: str) -> int:
+	async def get_position(self, ticker: str, *, positions_by_ticker: dict[str, int] | None = None) -> int:
 		"""Fetch signed position for ticker (positive=YES, negative=NO)."""
+
+		if positions_by_ticker is not None:
+			try:
+				return int(positions_by_ticker.get(str(ticker), 0))
+			except Exception:
+				return 0
 
 		inv = await fetch_inventory_summary(client=self.client, tickers=[str(ticker)])
 		ti = inv.per_ticker.get(str(ticker))
@@ -610,7 +987,64 @@ class KalshiMarketMaker:
 			return str(resp.get("id"))
 		return None
 
-	async def quote_market(self, snap: MarketSnapshot) -> None:
+	async def place_no_quote(self, *, ticker: str, action: str, price_cents: int, count: int) -> str | None:
+		"""Place a NO-side limit order (GTC)."""
+
+		if int(count) <= 0:
+			return None
+
+		if bool(self.cfg.dry_run):
+			log.info(
+				"DRY_RUN_QUOTE %s action=%s side=NO price=%dc count=%d",
+				str(ticker),
+				str(action),
+				int(price_cents),
+				int(count),
+			)
+			return f"dry-{uuid.uuid4()}"
+
+		try:
+			resp = await self.client.create_order(
+				ticker=str(ticker),
+				side="no",
+				action=str(action),  # "buy" or "sell"
+				count=int(count),
+				order_type="limit",
+				yes_price=None,
+				no_price=int(price_cents),
+				client_order_id=str(uuid.uuid4()),
+				post_only=bool(self.cfg.post_only),
+				reduce_only=None,
+				time_in_force=str(self.cfg.time_in_force),
+			)
+		except Exception as e:
+			if bool(self.cfg.post_only) and _is_post_only_cross_error(e):
+				log.info(
+					"MM_POSTONLY_CROSS %s action=%s side=NO price=%dc count=%d",
+					str(ticker),
+					str(action),
+					int(price_cents),
+					int(count),
+				)
+				return None
+			raise
+
+		order = resp.get("order") if isinstance(resp.get("order"), dict) else None
+		if order and isinstance(order.get("order_id"), str):
+			return str(order.get("order_id"))
+		if isinstance(resp.get("order_id"), str):
+			return str(resp.get("order_id"))
+		if isinstance(resp.get("id"), str):
+			return str(resp.get("id"))
+		return None
+
+	async def quote_market(
+		self,
+		snap: MarketSnapshot,
+		*,
+		closes_1m: list[float] | None = None,
+		positions_by_ticker: dict[str, int] | None = None,
+	) -> None:
 		ticker = str(snap.ticker)
 		loop = asyncio.get_running_loop()
 		now_ts = float(loop.time())
@@ -643,19 +1077,20 @@ class KalshiMarketMaker:
 				return
 
 		# Position + limits
-		pos = await self.get_position(ticker)
+		pos = await self.get_position(ticker, positions_by_ticker=positions_by_ticker)
 		if abs(int(pos)) >= int(self.cfg.max_abs_pos):
 			# At cap: only quote the side that reduces abs(pos).
-			log.info("MM_POS_CAP %s pos=%d max_abs_pos=%d", ticker, int(pos), int(self.cfg.max_abs_pos))
+			log.debug("MM_POS_CAP %s pos=%d max_abs_pos=%d", ticker, int(pos), int(self.cfg.max_abs_pos))
 
 		# Fair price from model
-		p_yes = await self.get_fair_prob_yes(snap)
-		fair_yes_cents = _clamp_price_cents(float(p_yes) * 100.0)
+		p_yes = await self.get_fair_prob_yes(snap, closes_1m=closes_1m)
+		yes_fair_cents = _clamp_price_cents(float(p_yes) * 100.0)
+		no_fair_cents = int(max(1, min(99, 100 - int(yes_fair_cents))))
 
-		# Direction-aware quoting (probability bands).
-		quote_buy, quote_sell, p_mode = self._desired_sides_for_probability(p_yes=float(p_yes))
-		if p_mode != "neutral":
-			log.info("MM_ONE_SIDED %s p_yes=%.3f mode=%s", ticker, float(p_yes), str(p_mode))
+		# Probability policy: decide whether to quote the increase-risk direction (BUY YES / SELL NO)
+		# and/or the decrease-risk direction (SELL YES / BUY NO). Inventory blocking applies on top.
+		quote_buy, quote_sell, _prob_mode = self._desired_sides_for_probability(p_yes=float(p_yes))
+		z = self._compute_trend_z(p_yes=float(p_yes))
 
 		# Inventory hard limits: block the side that increases inventory.
 		if int(pos) >= int(self.cfg.inventory_hard_limit):
@@ -680,7 +1115,7 @@ class KalshiMarketMaker:
 		# Inventory skew: shift fair to encourage flattening.
 		skew_cents = self._compute_inventory_skew_cents(pos=int(pos))
 		if int(skew_cents) != 0:
-			log.info(
+			log.debug(
 				"MM_INVENTORY_SKEW %s pos=%d skew=%+dc quadratic=%s",
 				ticker,
 				int(pos),
@@ -688,9 +1123,10 @@ class KalshiMarketMaker:
 				str(bool(self.cfg.inventory_skew_quadratic)),
 			)
 		# If long YES (pos>0), skew>0 => subtract moves fair down (discourage buying more YES).
-		fair_yes_cents = _clamp_price_cents(float(fair_yes_cents) - float(skew_cents))
+		yes_fair_cents = _clamp_price_cents(float(yes_fair_cents) - float(skew_cents))
+		no_fair_cents = int(max(1, min(99, 100 - int(yes_fair_cents))))
 
-		self._last_fair_yes_cents_by_ticker[ticker] = int(fair_yes_cents)
+		self._last_fair_yes_cents_by_ticker[ticker] = int(yes_fair_cents)
 		self._last_pos_by_ticker[ticker] = int(pos)
 
 		# Spread shaping (inventory + expiry widening).
@@ -708,40 +1144,108 @@ class KalshiMarketMaker:
 				str(spread_reason),
 			)
 
-		half_spread = max(float(int(spread_cents)) / 2.0, 0.5)
-		desired_bid_yes = _clamp_price_cents(float(fair_yes_cents) - float(half_spread)) if quote_buy else None
-		desired_ask_yes = _clamp_price_cents(float(fair_yes_cents) + float(half_spread)) if quote_sell else None
+		base_half_spread = max(float(int(spread_cents)) / 2.0, 0.5)
+		wrongway_extra = max(0.0, float(self.cfg.wrongway_extra_cents))
+		mid_skew = float(self.cfg.mid_skew_cents)
+		mid_yes_cents = float(yes_fair_cents) + float(mid_skew) * float(z)
+		bid_offset = float(base_half_spread) + float(wrongway_extra) * max(0.0, -float(z))
+		ask_offset = float(base_half_spread) + float(wrongway_extra) * max(0.0, +float(z))
+		yes_bid_cents = _clamp_price_cents(float(mid_yes_cents) - float(bid_offset)) if quote_buy else None
+		yes_ask_cents = _clamp_price_cents(float(mid_yes_cents) + float(ask_offset)) if quote_sell else None
+		# Derive corresponding NO quotes for logging/sanity checks.
+		no_bid_cents, no_ask_cents = _derive_no_quotes_from_yes_quotes(
+			yes_bid_cents=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+			yes_ask_cents=(int(yes_ask_cents) if yes_ask_cents is not None else None),
+		)
 
 		# If quoting both sides, enforce at least 1c gap.
-		if desired_bid_yes is not None and desired_ask_yes is not None and int(desired_ask_yes) <= int(desired_bid_yes):
-			desired_ask_yes = min(99, int(desired_bid_yes) + 1)
-
-		# Post-only safety clamping against current best YES book.
-		best_yes_bid = snap.best_yes_bid
-		best_yes_ask = snap.best_yes_ask
-		orig_bid = desired_bid_yes
-		orig_ask = desired_ask_yes
-		if desired_bid_yes is not None and best_yes_ask is not None:
-			desired_bid_yes = max(1, min(int(desired_bid_yes), int(best_yes_ask) - 1))
-			if int(desired_bid_yes) >= int(best_yes_ask):
-				desired_bid_yes = None
-		if desired_ask_yes is not None and best_yes_bid is not None:
-			desired_ask_yes = min(99, max(int(desired_ask_yes), int(best_yes_bid) + 1))
-			if int(desired_ask_yes) <= int(best_yes_bid):
-				desired_ask_yes = None
-		if (orig_bid != desired_bid_yes) or (orig_ask != desired_ask_yes):
-			log.debug(
-				"MM_POSTONLY_ADJUST %s best_bid=%s best_ask=%s bid=%s->%s ask=%s->%s",
-				ticker,
-				"-" if best_yes_bid is None else str(int(best_yes_bid)),
-				"-" if best_yes_ask is None else str(int(best_yes_ask)),
-				"-" if orig_bid is None else str(int(orig_bid)),
-				"-" if desired_bid_yes is None else str(int(desired_bid_yes)),
-				"-" if orig_ask is None else str(int(orig_ask)),
-				"-" if desired_ask_yes is None else str(int(desired_ask_yes)),
+		if yes_bid_cents is not None and yes_ask_cents is not None and int(yes_ask_cents) <= int(yes_bid_cents):
+			yes_ask_cents = min(99, int(yes_bid_cents) + 1)
+			no_bid_cents, no_ask_cents = _derive_no_quotes_from_yes_quotes(
+				yes_bid_cents=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+				yes_ask_cents=(int(yes_ask_cents) if yes_ask_cents is not None else None),
 			)
 
-		if desired_bid_yes is None and desired_ask_yes is None:
+		# Normalize books before post-only clamping (prevents YES/NO mixups).
+		best_yes_bid, best_yes_ask, best_no_bid, best_no_ask = self._normalize_best_books(
+			snap=snap,
+			yes_fair_cents=int(yes_fair_cents),
+		)
+
+		# Post-only clamping rules (side-aware):
+		# BUY  YES: P < best_yes_ask
+		# SELL YES: P > best_yes_bid
+		# BUY  NO : P < best_no_ask
+		# SELL NO : P > best_no_bid
+		orig_yes_bid = yes_bid_cents
+		orig_yes_ask = yes_ask_cents
+		orig_no_bid = no_bid_cents
+		orig_no_ask = no_ask_cents
+		if bool(self.cfg.post_only):
+			if yes_bid_cents is not None and best_yes_ask is not None and int(yes_bid_cents) >= int(best_yes_ask):
+				yes_bid_cents = int(max(1, min(99, int(best_yes_ask) - 1)))
+				if best_yes_ask is not None and int(yes_bid_cents) >= int(best_yes_ask):
+					yes_bid_cents = None
+			if yes_ask_cents is not None and best_yes_bid is not None and int(yes_ask_cents) <= int(best_yes_bid):
+				yes_ask_cents = int(max(1, min(99, int(best_yes_bid) + 1)))
+				if best_yes_bid is not None and int(yes_ask_cents) <= int(best_yes_bid):
+					yes_ask_cents = None
+			if no_bid_cents is not None and best_no_ask is not None and int(no_bid_cents) >= int(best_no_ask):
+				no_bid_cents = int(max(1, min(99, int(best_no_ask) - 1)))
+				if best_no_ask is not None and int(no_bid_cents) >= int(best_no_ask):
+					no_bid_cents = None
+			if no_ask_cents is not None and best_no_bid is not None and int(no_ask_cents) <= int(best_no_bid):
+				no_ask_cents = int(max(1, min(99, int(best_no_bid) + 1)))
+				if best_no_bid is not None and int(no_ask_cents) <= int(best_no_bid):
+					no_ask_cents = None
+		if (orig_yes_bid, orig_yes_ask, orig_no_bid, orig_no_ask) != (yes_bid_cents, yes_ask_cents, no_bid_cents, no_ask_cents):
+			log.debug(
+				"MM_POSTONLY_ADJUST %s yes_bid=%s->%s yes_ask=%s->%s no_bid=%s->%s no_ask=%s->%s",
+				ticker,
+				"-" if orig_yes_bid is None else str(int(orig_yes_bid)),
+				"-" if yes_bid_cents is None else str(int(yes_bid_cents)),
+				"-" if orig_yes_ask is None else str(int(orig_yes_ask)),
+				"-" if yes_ask_cents is None else str(int(yes_ask_cents)),
+				"-" if orig_no_bid is None else str(int(orig_no_bid)),
+				"-" if no_bid_cents is None else str(int(no_bid_cents)),
+				"-" if orig_no_ask is None else str(int(orig_no_ask)),
+				"-" if no_ask_cents is None else str(int(no_ask_cents)),
+			)
+
+		# Price mapping sanity check: catches YES/NO mixups before we place orders.
+		if not self._price_mapping_sanity_check(
+			ticker=ticker,
+			p_yes=float(p_yes),
+			yes_bid_cents=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+			yes_ask_cents=(int(yes_ask_cents) if yes_ask_cents is not None else None),
+			no_bid_cents=(int(no_bid_cents) if no_bid_cents is not None else None),
+			no_ask_cents=(int(no_ask_cents) if no_ask_cents is not None else None),
+			spread_cents=int(spread_cents),
+			invert_margin_cents=5,
+			snap=snap,
+		):
+			# Cancel to avoid leaving potentially-wrong stale quotes.
+			await self.cancel_open_quotes(ticker)
+			self._log_block(
+				ticker=ticker,
+				reason="price_map_error",
+				now_ts=float(now_ts),
+				p_yes=float(p_yes),
+				pos=int(pos),
+				fair_yes_cents=int(yes_fair_cents),
+				desired_bid_yes=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+				desired_ask_yes=(int(yes_ask_cents) if yes_ask_cents is not None else None),
+				snap=snap,
+			)
+			return
+
+		# If both books got fully invalidated (no post-only room), cancel & stop.
+		if (
+			yes_bid_cents is None
+			and yes_ask_cents is None
+			and no_bid_cents is None
+			and no_ask_cents is None
+		):
 			# If our policy says to quote nothing (or post-only room is gone), ensure no stale quotes remain.
 			await self.cancel_open_quotes(ticker)
 			self._log_block(
@@ -750,25 +1254,18 @@ class KalshiMarketMaker:
 				now_ts=float(now_ts),
 				p_yes=float(p_yes),
 				pos=int(pos),
-				fair_yes_cents=int(fair_yes_cents),
+				fair_yes_cents=int(yes_fair_cents),
 				desired_bid_yes=None,
 				desired_ask_yes=None,
 				snap=snap,
-			)
-			log.info(
-				"MM_NO_QUOTE %s p_yes=%.3f pos=%d fair_yes=%dc",
-				ticker,
-				float(p_yes),
-				int(pos),
-				int(fair_yes_cents),
 			)
 			return
 
 		# Anti-spam refresh guard.
 		if not self._should_refresh_quotes(
 			ticker=ticker,
-			desired_bid_yes=(int(desired_bid_yes) if desired_bid_yes is not None else None),
-			desired_ask_yes=(int(desired_ask_yes) if desired_ask_yes is not None else None),
+			desired_bid_yes=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+			desired_ask_yes=(int(yes_ask_cents) if yes_ask_cents is not None else None),
 			now_ts=float(now_ts),
 		):
 			log.debug("MM_QUOTE_SKIP %s min_refresh not reached", ticker)
@@ -778,23 +1275,68 @@ class KalshiMarketMaker:
 		if bool(self.cfg.cancel_before_replace):
 			await self.cancel_open_quotes(ticker)
 
-		# Size each side so fills cannot violate the abs position cap.
-		max_buy = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="buy")
-		max_sell = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="sell")
+		# Choose at most ONE order per signed-risk direction:
+		# - Increase signed pos: BUY YES or SELL NO
+		# - Decrease signed pos: SELL YES or BUY NO
+		base_size = max(0, int(self.cfg.quote_size))
+		size_reduce = float(self.cfg.size_reduce)
+		if not math.isfinite(size_reduce):
+			size_reduce = 0.0
+		size_reduce = max(0.0, min(1.0, float(size_reduce)))
+		inc_factor = 1.0 - float(size_reduce) * max(0.0, -float(z))  # wrong-way when z<0
+		dec_factor = 1.0 - float(size_reduce) * max(0.0, +float(z))  # wrong-way when z>0
+		inc_target = int(round(float(base_size) * float(inc_factor)))
+		dec_target = int(round(float(base_size) * float(dec_factor)))
 
-		buy_size = 0
-		sell_size = 0
-		if desired_bid_yes is not None and quote_buy:
-			buy_size = min(int(self.cfg.quote_size), int(max_buy))
-		if desired_ask_yes is not None and quote_sell:
-			sell_size = min(int(self.cfg.quote_size), int(max_sell))
+		# Compute max sizes by instrument/action.
+		max_buy_yes = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="buy", instrument="yes")
+		max_sell_yes = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="sell", instrument="yes")
+		max_buy_no = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="buy", instrument="no")
+		max_sell_no = _max_count_for_action(pos=int(pos), max_abs_pos=int(self.cfg.max_abs_pos), action="sell", instrument="no")
 
-		if int(buy_size) <= 0:
-			desired_bid_yes = None
-		if int(sell_size) <= 0:
-			desired_ask_yes = None
+		def _dist_buy(price: int | None, best_ask: int | None) -> int:
+			if price is None or best_ask is None:
+				return 999
+			return max(1, int(best_ask) - int(price))
 
-		if desired_bid_yes is None and desired_ask_yes is None:
+		def _dist_sell(price: int | None, best_bid: int | None) -> int:
+			if price is None or best_bid is None:
+				return 999
+			return max(1, int(price) - int(best_bid))
+
+		# Candidates for increasing pos.
+		cand_inc: list[tuple[str, str, int, int, int]] = []  # (instrument, action, price, size, dist)
+		if quote_buy and yes_bid_cents is not None and inc_target > 0:
+			sz = min(int(max_buy_yes), int(inc_target))
+			if sz > 0:
+				cand_inc.append(("yes", "buy", int(yes_bid_cents), int(sz), _dist_buy(int(yes_bid_cents), best_yes_ask)))
+		if quote_buy and no_ask_cents is not None and inc_target > 0:
+			sz = min(int(max_sell_no), int(inc_target))
+			if sz > 0:
+				cand_inc.append(("no", "sell", int(no_ask_cents), int(sz), _dist_sell(int(no_ask_cents), best_no_bid)))
+
+		# Candidates for decreasing pos.
+		cand_dec: list[tuple[str, str, int, int, int]] = []
+		if quote_sell and yes_ask_cents is not None and dec_target > 0:
+			sz = min(int(max_sell_yes), int(dec_target))
+			if sz > 0:
+				cand_dec.append(("yes", "sell", int(yes_ask_cents), int(sz), _dist_sell(int(yes_ask_cents), best_yes_bid)))
+		if quote_sell and no_bid_cents is not None and dec_target > 0:
+			sz = min(int(max_buy_no), int(dec_target))
+			if sz > 0:
+				cand_dec.append(("no", "buy", int(no_bid_cents), int(sz), _dist_buy(int(no_bid_cents), best_no_ask)))
+
+		# Pick the most competitive per direction (smallest dist). Ties prefer YES.
+		def _pick(cands: list[tuple[str, str, int, int, int]]) -> tuple[str, str, int, int] | None:
+			if not cands:
+				return None
+			cands2 = sorted(cands, key=lambda x: (int(x[4]), 0 if x[0] == "yes" else 1))
+			inst, act, px, sz, _ = cands2[0]
+			return inst, act, int(px), int(sz)
+
+		pick_inc = _pick(cand_inc)
+		pick_dec = _pick(cand_dec)
+		if pick_inc is None and pick_dec is None:
 			await self.cancel_open_quotes(ticker)
 			self._log_block(
 				ticker=ticker,
@@ -802,35 +1344,35 @@ class KalshiMarketMaker:
 				now_ts=float(now_ts),
 				p_yes=float(p_yes),
 				pos=int(pos),
-				fair_yes_cents=int(fair_yes_cents),
-				desired_bid_yes=None,
-				desired_ask_yes=None,
+				fair_yes_cents=int(yes_fair_cents),
+				desired_bid_yes=(int(yes_bid_cents) if yes_bid_cents is not None else None),
+				desired_ask_yes=(int(yes_ask_cents) if yes_ask_cents is not None else None),
 				snap=snap,
-			)
-			log.info(
-				"MM_NO_QUOTE %s reason=size_or_limits p_yes=%.3f pos=%d",
-				ticker,
-				float(p_yes),
-				int(pos),
 			)
 			return
 
 		yes_bid_id = None
 		yes_ask_id = None
-		if desired_bid_yes is not None:
-			yes_bid_id = await self.place_yes_quote(
-				ticker=ticker,
-				action="buy",
-				price_cents=int(desired_bid_yes),
-				count=int(buy_size),
-			)
-		if desired_ask_yes is not None:
-			yes_ask_id = await self.place_yes_quote(
-				ticker=ticker,
-				action="sell",
-				price_cents=int(desired_ask_yes),
-				count=int(sell_size),
-			)
+		no_bid_id = None
+		no_ask_id = None
+		# Invariants before sending orders.
+		send_parts: list[str] = []
+		if pick_inc is not None:
+			inst, act, px, sz = pick_inc
+			if inst == "yes" and act == "buy":
+				yes_bid_id = await self.place_yes_quote(ticker=ticker, action="buy", price_cents=int(px), count=int(sz))
+				send_parts.append(f"buy_yes@{int(px)}x{int(sz)}")
+			elif inst == "no" and act == "sell":
+				no_ask_id = await self.place_no_quote(ticker=ticker, action="sell", price_cents=int(px), count=int(sz))
+				send_parts.append(f"sell_no@{int(px)}x{int(sz)}")
+		if pick_dec is not None:
+			inst, act, px, sz = pick_dec
+			if inst == "yes" and act == "sell":
+				yes_ask_id = await self.place_yes_quote(ticker=ticker, action="sell", price_cents=int(px), count=int(sz))
+				send_parts.append(f"sell_yes@{int(px)}x{int(sz)}")
+			elif inst == "no" and act == "buy":
+				no_bid_id = await self.place_no_quote(ticker=ticker, action="buy", price_cents=int(px), count=int(sz))
+				send_parts.append(f"buy_no@{int(px)}x{int(sz)}")
 
 		# If we didn't cancel-before-replace, clean up prior orders after placing new ones.
 		if not bool(self.cfg.cancel_before_replace) and prev_orders and not bool(self.cfg.dry_run):
@@ -844,26 +1386,61 @@ class KalshiMarketMaker:
 		self.open_orders[ticker] = {
 			"yes_bid_id": str(yes_bid_id or ""),
 			"yes_ask_id": str(yes_ask_id or ""),
+			"no_bid_id": str(no_bid_id or ""),
+			"no_ask_id": str(no_ask_id or ""),
 		}
 		self._last_quote_ts_by_ticker[ticker] = float(now_ts)
+		# Track desired economic-sided quotes via YES-book equivalents (for refresh guard).
+		# If we chose NO orders, map them into implied YES prices for comparison.
+		implied_yes_bid = None
+		implied_yes_ask = None
+		for part in send_parts:
+			if part.startswith("buy_yes@"):  # buy_yes@P
+				try:
+					implied_yes_bid = int(part.split("@")[1].split("x")[0])
+				except Exception:
+					pass
+			if part.startswith("sell_yes@"):  # sell_yes@P
+				try:
+					implied_yes_ask = int(part.split("@")[1].split("x")[0])
+				except Exception:
+					pass
+			if part.startswith("buy_no@"):  # buy_no@P => implies sell_yes at 100-P
+				try:
+					pno = int(part.split("@")[1].split("x")[0])
+					implied_yes_ask = int(max(1, min(99, 100 - int(pno))))
+				except Exception:
+					pass
+			if part.startswith("sell_no@"):  # sell_no@P => implies buy_yes at 100-P
+				try:
+					pno = int(part.split("@")[1].split("x")[0])
+					implied_yes_bid = int(max(1, min(99, 100 - int(pno))))
+				except Exception:
+					pass
 		self._last_desired_quote_by_ticker[ticker] = (
-			int(desired_bid_yes) if desired_bid_yes is not None else None,
-			int(desired_ask_yes) if desired_ask_yes is not None else None,
+			int(implied_yes_bid) if implied_yes_bid is not None else None,
+			int(implied_yes_ask) if implied_yes_ask is not None else None,
 		)
 
+		# Single unambiguous quote line: YES+NO fairs/quotes + best books + sends.
+		sends = " ".join(send_parts) if send_parts else "send=none"
 		log.info(
-			"MM_QUOTE %s pos=%d p_yes=%.3f fair_yes=%dc spread=%dc bid=%s(%d) ask=%s(%d) spot=%s strike=%s tte=%ss",
+			"MM_QUOTE %s p_yes=%.3f z=%.2f pos=%d yes_fair=%dc yes_bid=%s yes_ask=%s no_fair=%dc no_bid=%s no_ask=%s best_yes=%s/%s best_no=%s/%s send=%s tte=%s",
 			ticker,
-			int(pos),
 			float(p_yes),
-			int(fair_yes_cents),
-			int(spread_cents),
-			"-" if desired_bid_yes is None else str(int(desired_bid_yes)),
-			int(buy_size),
-			"-" if desired_ask_yes is None else str(int(desired_ask_yes)),
-			int(sell_size),
-			"-" if snap.btc_spot_usd is None else f"${float(snap.btc_spot_usd):.2f}",
-			"-" if snap.price_to_beat is None else f"${float(snap.price_to_beat):.2f}",
+			float(z),
+			int(pos),
+			int(yes_fair_cents),
+			"-" if yes_bid_cents is None else str(int(yes_bid_cents)),
+			"-" if yes_ask_cents is None else str(int(yes_ask_cents)),
+			int(no_fair_cents),
+			"-" if no_bid_cents is None else str(int(no_bid_cents)),
+			"-" if no_ask_cents is None else str(int(no_ask_cents)),
+			"-" if best_yes_bid is None else str(int(best_yes_bid)),
+			"-" if best_yes_ask is None else str(int(best_yes_ask)),
+			"-" if best_no_bid is None else str(int(best_no_bid)),
+			"-" if best_no_ask is None else str(int(best_no_ask)),
+			sends,
 			"?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
 		)
 
@@ -921,8 +1498,31 @@ class KalshiMarketMaker:
 
 					self._last_polled_tickers = [str(s.ticker) for s in snaps]
 
+					# Cache shared inputs once per loop to avoid per-ticker refetch.
+					tickers = [str(s.ticker) for s in snaps if getattr(s, "ticker", None) is not None]
+					closes_task = asyncio.create_task(fetch_recent_1m_closes(limit=6))
+					inv_task = None
+					if tickers:
+						inv_task = asyncio.create_task(fetch_inventory_summary(client=self.client, tickers=tickers))
+
+					closes_1m = await closes_task
+					positions_by_ticker: dict[str, int] = {}
+					if inv_task is not None:
+						inv = await inv_task
+						for t in tickers:
+							ti = inv.per_ticker.get(str(t))
+							if ti is None:
+								continue
+							try:
+								positions_by_ticker[str(t)] = int(ti.position)
+							except Exception:
+								positions_by_ticker[str(t)] = 0
+
 					# poll_once() already returns open BTC15m markets; no snap.status field.
-					tasks = [self.quote_market(s) for s in snaps]
+					tasks = [
+						self.quote_market(s, closes_1m=closes_1m, positions_by_ticker=positions_by_ticker)
+						for s in snaps
+					]
 					results = await asyncio.gather(*tasks, return_exceptions=True)
 					for r in results:
 						if isinstance(r, Exception):
@@ -1028,6 +1628,30 @@ def _parse_args() -> argparse.Namespace:
 		type=float,
 		default=_cfg_default("deadzone_neutral_high"),
 		help="If p_yes in [low,high], quote both sides",
+	)
+	p.add_argument(
+		"--trend-z-denom",
+		type=float,
+		default=_cfg_default("trend_z_denom"),
+		help="Denominator for z=(p-0.5)/denom (clamped to [-1,1])",
+	)
+	p.add_argument(
+		"--mid-skew-cents",
+		type=float,
+		default=_cfg_default("mid_skew_cents"),
+		help="Mid skew (cents) toward model direction",
+	)
+	p.add_argument(
+		"--wrongway-extra-cents",
+		type=float,
+		default=_cfg_default("wrongway_extra_cents"),
+		help="Extra half-spread (cents) on the wrong-way side",
+	)
+	p.add_argument(
+		"--size-reduce",
+		type=float,
+		default=_cfg_default("size_reduce"),
+		help="Fractional size reduction on wrong-way side (0..1)",
 	)
 	p.add_argument(
 		"--momentum-pause-abs-return-1m",
@@ -1138,6 +1762,10 @@ async def main() -> None:
 		one_sided_threshold_low=float(args.one_sided_threshold_low),
 		deadzone_neutral_low=float(args.deadzone_neutral_low),
 		deadzone_neutral_high=float(args.deadzone_neutral_high),
+		trend_z_denom=float(args.trend_z_denom),
+		mid_skew_cents=float(args.mid_skew_cents),
+		wrongway_extra_cents=float(args.wrongway_extra_cents),
+		size_reduce=float(args.size_reduce),
 		momentum_pause_abs_return_1m=float(args.momentum_pause_abs_return_1m),
 		momentum_pause_seconds=int(args.momentum_pause_seconds),
 		force_widen_tte_sec=int(args.force_widen_tte_sec),
