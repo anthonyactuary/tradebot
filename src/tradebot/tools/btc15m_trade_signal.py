@@ -42,6 +42,7 @@ from tradebot.tools.btc15m_live_inference import (
     build_feature_dict,
     fetch_recent_1m_closes,
     predict_probability,
+    choose_proxy_spot_usd,
 )
 
 
@@ -55,6 +56,8 @@ class TradeSignal:
 
     price_to_beat: float | None
     btc_spot_usd: float | None
+    proxy_spot_usd: float | None
+    spot_source: str | None
     seconds_to_expiry: int | None
 
     market_p_yes: float | None
@@ -89,6 +92,8 @@ def _to_clean_log_row(s: TradeSignal) -> dict[str, Any]:
     out: dict[str, Any] = {
         "ticker": s.ticker,
         "seconds_to_expiry": s.seconds_to_expiry,
+        "spot_source": s.spot_source,
+        "proxy_spot_usd": s.proxy_spot_usd,
         "fee_mode": s.fee_mode,
         "fee_yes_usd_per_contract": s.fee_yes_usd_per_contract,
         "fee_no_usd_per_contract": s.fee_no_usd_per_contract,
@@ -177,8 +182,9 @@ def _to_pretty_line(s: TradeSignal) -> str:
         ts,
         s.ticker,
         f"tte={_fmt_tte(s.seconds_to_expiry)}",
-        f"spot={_fmt_usd(s.btc_spot_usd, ndp=2)}",
+        f"spot={_fmt_usd(s.proxy_spot_usd, ndp=2)}",
         f"strike={_fmt_usd(s.price_to_beat, ndp=2)}",
+        f"spot_src={s.spot_source or '-'}",
         f"fee_mode={s.fee_mode}",
         f"fee/c={_fmt_usd(fee_pc, ndp=4) if fee_pc is not None else '-'}",
         f"p_up={_fmt_pct(p_up)}",
@@ -244,16 +250,39 @@ async def signal_for_snapshot(
     try:
         if snap.price_to_beat is None:
             raise ValueError("missing price_to_beat")
-        if snap.btc_spot_usd is None:
-            raise ValueError("missing btc_spot_usd")
         if snap.seconds_to_expiry is None:
             raise ValueError("missing seconds_to_expiry")
         if snap.market_p_yes is None or snap.market_p_no is None:
             raise ValueError("missing market_p_yes/market_p_no")
 
+        proxy_spot_usd, spot_source = choose_proxy_spot_usd(snap)
+        if proxy_spot_usd is None:
+            return TradeSignal(
+                poll_utc_iso=snap.poll_utc_iso,
+                ticker=snap.ticker,
+                price_to_beat=snap.price_to_beat,
+                btc_spot_usd=snap.btc_spot_usd,
+                proxy_spot_usd=None,
+                spot_source=str(spot_source),
+                seconds_to_expiry=snap.seconds_to_expiry,
+                market_p_yes=snap.market_p_yes,
+                market_p_no=snap.market_p_no,
+                contracts=int(contracts),
+                fee_mode=fee_mode,
+                fee_yes_usd_per_contract=None,
+                fee_no_usd_per_contract=None,
+                features=None,
+                p_yes=None,
+                p_no=None,
+                edge=None,
+                decision=None,
+                position=None,
+                error=f"skip:missing_spot spot_source={spot_source}",
+            )
+
         feats = build_feature_dict(
             price_to_beat=float(snap.price_to_beat),
-            btc_spot_usd=float(snap.btc_spot_usd),
+            btc_spot_usd=float(proxy_spot_usd),
             seconds_to_expiry=int(snap.seconds_to_expiry),
             recent_closes_1m=recent_closes_1m,
         )
@@ -294,6 +323,7 @@ async def signal_for_snapshot(
                 kelly_multiplier=float(kelly_multiplier),
                 fee_per_contract_usd=float(fee),
                 max_fraction=float(kelly_max_fraction),
+                min_contracts_if_positive_edge=1,
             )
 
         return TradeSignal(
@@ -301,6 +331,8 @@ async def signal_for_snapshot(
             ticker=snap.ticker,
             price_to_beat=snap.price_to_beat,
             btc_spot_usd=snap.btc_spot_usd,
+            proxy_spot_usd=float(proxy_spot_usd),
+            spot_source=str(spot_source),
             seconds_to_expiry=snap.seconds_to_expiry,
             market_p_yes=snap.market_p_yes,
             market_p_no=snap.market_p_no,
@@ -322,6 +354,8 @@ async def signal_for_snapshot(
             ticker=getattr(snap, "ticker", ""),
             price_to_beat=getattr(snap, "price_to_beat", None),
             btc_spot_usd=getattr(snap, "btc_spot_usd", None),
+            proxy_spot_usd=None,
+            spot_source=None,
             seconds_to_expiry=getattr(snap, "seconds_to_expiry", None),
             market_p_yes=getattr(snap, "market_p_yes", None),
             market_p_no=getattr(snap, "market_p_no", None),

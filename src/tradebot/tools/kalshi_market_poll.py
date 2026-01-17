@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import logging
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,12 +30,113 @@ import httpx
 from tradebot.config import Settings
 from tradebot.kalshi.client import KalshiClient
 from tradebot.kalshi.orderbook import BestPrices, compute_best_prices
+from tradebot.tools.coinbase_vwap import RollingVWAP
 
 
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+COINBASE_TRADES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/trades"
+COINBASE_BOOK_URL = "https://api.exchange.coinbase.com/products/BTC-USD/book"
 
 
 log = logging.getLogger(__name__)
+
+
+# Rolling VWAP state (module-level so it persists across polls)
+_ROLLING_VWAP = RollingVWAP()
+
+# Dedup trade ids with a bounded FIFO (acts like a simple LRU)
+_SEEN_TRADE_IDS: set[str] = set()
+_SEEN_TRADE_IDS_Q: deque[str] = deque()
+_MAX_SEEN_TRADE_IDS = 5000
+
+
+def _seen_trade_id_add(trade_id: str) -> bool:
+    """Return True if trade_id is new (and is added), else False."""
+
+    tid = str(trade_id)
+    if tid in _SEEN_TRADE_IDS:
+        return False
+    _SEEN_TRADE_IDS.add(tid)
+    _SEEN_TRADE_IDS_Q.append(tid)
+    while len(_SEEN_TRADE_IDS_Q) > int(_MAX_SEEN_TRADE_IDS):
+        old = _SEEN_TRADE_IDS_Q.popleft()
+        _SEEN_TRADE_IDS.discard(old)
+    return True
+
+
+def _iso_to_ts_ms(v: Any) -> int | None:
+    if not v:
+        return None
+    if isinstance(v, (int, float)):
+        # Heuristic: milliseconds vs seconds
+        ts = float(v)
+        if ts > 1e12:
+            return int(ts)
+        return int(ts * 1000.0)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            when = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(when.timestamp() * 1000.0)
+        except Exception:
+            return None
+    return None
+
+
+async def fetch_recent_btc_trades_coinbase(*, limit: int = 100) -> list[dict[str, Any]]:
+    """Fetch the most recent BTC-USD trades from Coinbase REST."""
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {"Accept": "application/json"}
+            resp = await client.get(COINBASE_TRADES_URL, headers=headers, params={"limit": int(limit)})
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                return [d for d in data if isinstance(d, dict)]
+            return []
+    except Exception as e:
+        log.warning("COINBASE_TRADES_ERROR error=%s", e)
+        return []
+
+
+async def fetch_coinbase_best_bid_ask() -> tuple[float | None, float | None, float | None]:
+    """Fetch top-of-book bid/ask for BTC-USD from Coinbase and return (bid, ask, mid)."""
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {"Accept": "application/json"}
+            resp = await client.get(COINBASE_BOOK_URL, headers=headers, params={"level": 1})
+            resp.raise_for_status()
+            data = resp.json() or {}
+
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        best_bid: float | None = None
+        best_ask: float | None = None
+
+        if isinstance(bids, list) and bids:
+            try:
+                best_bid = float(bids[0][0])
+            except Exception:
+                best_bid = None
+
+        if isinstance(asks, list) and asks:
+            try:
+                best_ask = float(asks[0][0])
+            except Exception:
+                best_ask = None
+
+        mid: float | None = None
+        if best_bid is not None and best_ask is not None:
+            mid = (float(best_bid) + float(best_ask)) / 2.0
+
+        return (best_bid, best_ask, mid)
+    except Exception as e:
+        log.warning("COINBASE_BOOK_ERROR error=%s", e)
+        return (None, None, None)
 
 
 def _utcnow() -> dt.datetime:
@@ -158,6 +260,16 @@ class MarketSnapshot:
     # External spot reference (Coinbase)
     btc_spot_usd: float | None
 
+    # Coinbase L1 orderbook
+    coinbase_best_bid: float | None
+    coinbase_best_ask: float | None
+    coinbase_mid_usd: float | None
+
+    # Coinbase rolling VWAP (derived from recent trades)
+    coinbase_vwap_60s: float | None
+    coinbase_vwap_count: int
+    coinbase_vwap_age_ms: int | None
+
     # Timing
     seconds_to_expiry: int | None
     cutoff_time_utc_iso: str | None
@@ -262,6 +374,12 @@ async def fetch_snapshot_for_market(
     market: dict[str, Any],
     *,
     btc_spot_usd: float | None,
+    coinbase_best_bid: float | None,
+    coinbase_best_ask: float | None,
+    coinbase_mid_usd: float | None,
+    coinbase_vwap_60s: float | None,
+    coinbase_vwap_count: int,
+    coinbase_vwap_age_ms: int | None,
 ) -> MarketSnapshot:
     now = _utcnow()
     ticker = str(market.get("ticker") or "").strip()
@@ -290,6 +408,12 @@ async def fetch_snapshot_for_market(
         poll_utc_iso=now.isoformat(),
         ticker=ticker,
         btc_spot_usd=btc_spot_usd,
+        coinbase_best_bid=coinbase_best_bid,
+        coinbase_best_ask=coinbase_best_ask,
+        coinbase_mid_usd=coinbase_mid_usd,
+        coinbase_vwap_60s=coinbase_vwap_60s,
+        coinbase_vwap_count=int(coinbase_vwap_count),
+        coinbase_vwap_age_ms=coinbase_vwap_age_ms,
         seconds_to_expiry=seconds_to_expiry,
         cutoff_time_utc_iso=cutoff_iso,
         cutoff_time_source=cutoff_field,
@@ -311,10 +435,26 @@ async def _safe_fetch_snapshot_for_market(
     market: dict[str, Any],
     *,
     btc_spot_usd: float | None,
+    coinbase_best_bid: float | None,
+    coinbase_best_ask: float | None,
+    coinbase_mid_usd: float | None,
+    coinbase_vwap_60s: float | None,
+    coinbase_vwap_count: int,
+    coinbase_vwap_age_ms: int | None,
 ) -> MarketSnapshot | None:
     ticker = str(market.get("ticker") or "").strip()
     try:
-        return await fetch_snapshot_for_market(client, market, btc_spot_usd=btc_spot_usd)
+        return await fetch_snapshot_for_market(
+            client,
+            market,
+            btc_spot_usd=btc_spot_usd,
+            coinbase_best_bid=coinbase_best_bid,
+            coinbase_best_ask=coinbase_best_ask,
+            coinbase_mid_usd=coinbase_mid_usd,
+            coinbase_vwap_60s=coinbase_vwap_60s,
+            coinbase_vwap_count=coinbase_vwap_count,
+            coinbase_vwap_age_ms=coinbase_vwap_age_ms,
+        )
     except Exception as e:
         # Treat per-market failures as transient and skip that market for this poll.
         # This avoids a single bad gateway / timeout from killing the whole bot.
@@ -330,6 +470,73 @@ async def poll_once(
     limit_markets: int = 2,
     min_seconds_to_expiry: int = 0,
 ) -> list[MarketSnapshot]:
+    # Feed the rolling VWAP with deduped Coinbase trades.
+    trades = await fetch_recent_btc_trades_coinbase(limit=100)
+    parsed: list[tuple[int, str, float, float]] = []
+    for t in trades:
+        tid = t.get("trade_id")
+        if tid is None:
+            tid = t.get("id")
+        if tid is None:
+            continue
+
+        ts_ms = _iso_to_ts_ms(t.get("time"))
+        if ts_ms is None:
+            continue
+
+        try:
+            price = float(t.get("price"))
+            size = float(t.get("size"))
+        except Exception:
+            continue
+
+        parsed.append((int(ts_ms), str(tid), float(price), float(size)))
+
+    # Coinbase often returns newest-first; ingest oldest->newest so our deque stays ordered.
+    parsed.sort(key=lambda x: x[0])
+
+    ingested = 0
+    for ts_ms, tid, price, size in parsed:
+        if not _seen_trade_id_add(tid):
+            continue
+        _ROLLING_VWAP.add_trade(ts_ms, price, size)
+        ingested += 1
+
+    # Use a "safe" now for VWAP cutoff + freshness that cannot be behind the newest
+    # Coinbase timestamp we have in-buffer (avoids negative ages due to clock skew).
+    latest_ts_ms = _ROLLING_VWAP.latest_ts_ms()
+    now_ms_local = int(_utcnow().timestamp() * 1000.0)
+    safe_now_ms = int(now_ms_local) if latest_ts_ms is None else max(int(now_ms_local), int(latest_ts_ms))
+
+    vwap_60s = _ROLLING_VWAP.vwap(safe_now_ms, window_seconds=60)
+    vwap_count = int(_ROLLING_VWAP.count())
+    vwap_age_ms: int | None = None
+    if latest_ts_ms is not None:
+        raw_age = int(safe_now_ms) - int(latest_ts_ms)
+        if raw_age < -5000:
+            log.warning(
+                "COINBASE_VWAP_NEG_AGE now_ms_local=%d safe_now_ms=%d latest_ts_ms=%d raw_age_ms=%d",
+                int(now_ms_local),
+                int(safe_now_ms),
+                int(latest_ts_ms),
+                int(raw_age),
+            )
+        vwap_age_ms = max(0, int(raw_age))
+
+    cb_bid, cb_ask, cb_mid = await fetch_coinbase_best_bid_ask()
+    log.info(
+        "COINBASE_VWAP now_ms=%d now_ms_local=%d trades_ingested=%d vwap_count=%d vwap_60s=%s vwap_age_ms=%s cb_bid=%s cb_ask=%s cb_mid=%s",
+        int(safe_now_ms),
+        int(now_ms_local),
+        int(ingested),
+        int(vwap_count),
+        "-" if vwap_60s is None else f"{float(vwap_60s):.2f}",
+        "-" if vwap_age_ms is None else str(int(vwap_age_ms)),
+        "-" if cb_bid is None else f"{float(cb_bid):.2f}",
+        "-" if cb_ask is None else f"{float(cb_ask):.2f}",
+        "-" if cb_mid is None else f"{float(cb_mid):.2f}",
+    )
+
     btc_spot_usd = await fetch_btc_spot_price_coinbase()
     markets = await pick_active_markets(
         client,
@@ -343,7 +550,20 @@ async def poll_once(
         return []
 
     snaps = await asyncio.gather(
-        *(_safe_fetch_snapshot_for_market(client, m, btc_spot_usd=btc_spot_usd) for m in markets)
+        *(
+            _safe_fetch_snapshot_for_market(
+                client,
+                m,
+                btc_spot_usd=btc_spot_usd,
+                coinbase_best_bid=cb_bid,
+                coinbase_best_ask=cb_ask,
+                coinbase_mid_usd=cb_mid,
+                coinbase_vwap_60s=vwap_60s,
+                coinbase_vwap_count=vwap_count,
+                coinbase_vwap_age_ms=vwap_age_ms,
+            )
+            for m in markets
+        )
     )
     return [s for s in snaps if s is not None]
 

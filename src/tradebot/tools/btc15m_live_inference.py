@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import logging
 import math
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -41,6 +42,9 @@ from tradebot.tools.kalshi_market_poll import MarketSnapshot, poll_once
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
 
+log = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class InferenceResult:
     poll_utc_iso: str
@@ -48,6 +52,13 @@ class InferenceResult:
 
     price_to_beat: float | None
     btc_spot_usd: float | None
+    proxy_spot_usd: float | None
+    spot_source: str | None
+
+    # Optional debug fields for postmortems
+    coinbase_mid_usd: float | None
+    coinbase_vwap_60s: float | None
+    coinbase_vwap_age_ms: int | None
     seconds_to_expiry: int | None
 
     contracts: int | None
@@ -59,6 +70,31 @@ class InferenceResult:
     features: dict[str, float] | None
     p_up: float | None
     error: str | None = None
+
+
+def choose_proxy_spot_usd(snap: MarketSnapshot) -> tuple[float | None, str]:
+    """Pick the spot proxy used for delta.
+
+    Near expiry, prefer a fresh rolling trade VWAP; otherwise fall back to Coinbase ticker.
+    """
+
+    if (
+        snap.seconds_to_expiry is not None
+        and int(snap.seconds_to_expiry) <= 60
+        and snap.coinbase_vwap_60s is not None
+        and snap.coinbase_vwap_age_ms is not None
+        and int(snap.coinbase_vwap_age_ms) <= 2000
+        and int(snap.coinbase_vwap_count) >= 10
+    ):
+        return (float(snap.coinbase_vwap_60s), "vwap_60s")
+
+    if snap.coinbase_mid_usd is not None:
+        return (float(snap.coinbase_mid_usd), "coinbase_mid")
+
+    if snap.btc_spot_usd is not None:
+        return (float(snap.btc_spot_usd), "coinbase_ticker")
+
+    return (None, "missing")
 
 
 def _fees_from_snapshot(*, snap: MarketSnapshot, contracts: int) -> dict[str, float | None]:
@@ -221,21 +257,95 @@ async def infer_for_snapshot(
     snap: MarketSnapshot,
     *,
     contracts: int,
+    recent_closes_1m: list[float],
 ) -> InferenceResult:
+    proxy_spot_usd, spot_source = choose_proxy_spot_usd(snap)
     try:
         if snap.price_to_beat is None:
             raise ValueError("missing price_to_beat")
-        if snap.btc_spot_usd is None:
-            raise ValueError("missing btc_spot_usd")
         if snap.seconds_to_expiry is None:
             raise ValueError("missing seconds_to_expiry")
 
-        closes = await fetch_recent_1m_closes(limit=6)
+        K = float(snap.price_to_beat)
+        S = proxy_spot_usd
+
+        if not (K > 0 and math.isfinite(K)):
+            reason = "invalid_strike"
+            log.warning("INFER_SKIP ticker=%s reason=%s spot_source=%s", snap.ticker, reason, spot_source)
+            return InferenceResult(
+                poll_utc_iso=snap.poll_utc_iso,
+                ticker=snap.ticker,
+                price_to_beat=snap.price_to_beat,
+                btc_spot_usd=snap.btc_spot_usd,
+                proxy_spot_usd=proxy_spot_usd,
+                spot_source=str(spot_source),
+                coinbase_mid_usd=snap.coinbase_mid_usd,
+                coinbase_vwap_60s=snap.coinbase_vwap_60s,
+                coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                seconds_to_expiry=snap.seconds_to_expiry,
+                contracts=int(contracts),
+                taker_fee_yes_usd=None,
+                maker_fee_yes_usd=None,
+                taker_fee_no_usd=None,
+                maker_fee_no_usd=None,
+                features=None,
+                p_up=None,
+                error=f"skip:{reason} spot_source={spot_source}",
+            )
+
+        if S is None:
+            reason = "missing_spot"
+            log.warning("INFER_SKIP ticker=%s reason=%s spot_source=%s", snap.ticker, reason, spot_source)
+            return InferenceResult(
+                poll_utc_iso=snap.poll_utc_iso,
+                ticker=snap.ticker,
+                price_to_beat=snap.price_to_beat,
+                btc_spot_usd=snap.btc_spot_usd,
+                proxy_spot_usd=proxy_spot_usd,
+                spot_source=str(spot_source),
+                coinbase_mid_usd=snap.coinbase_mid_usd,
+                coinbase_vwap_60s=snap.coinbase_vwap_60s,
+                coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                seconds_to_expiry=snap.seconds_to_expiry,
+                contracts=int(contracts),
+                taker_fee_yes_usd=None,
+                maker_fee_yes_usd=None,
+                taker_fee_no_usd=None,
+                maker_fee_no_usd=None,
+                features=None,
+                p_up=None,
+                error=f"skip:{reason} spot_source={spot_source}",
+            )
+
+        if not (float(S) > 0 and math.isfinite(float(S))):
+            reason = "invalid_spot"
+            log.warning("INFER_SKIP ticker=%s reason=%s spot_source=%s", snap.ticker, reason, spot_source)
+            return InferenceResult(
+                poll_utc_iso=snap.poll_utc_iso,
+                ticker=snap.ticker,
+                price_to_beat=snap.price_to_beat,
+                btc_spot_usd=snap.btc_spot_usd,
+                proxy_spot_usd=proxy_spot_usd,
+                spot_source=str(spot_source),
+                coinbase_mid_usd=snap.coinbase_mid_usd,
+                coinbase_vwap_60s=snap.coinbase_vwap_60s,
+                coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                seconds_to_expiry=snap.seconds_to_expiry,
+                contracts=int(contracts),
+                taker_fee_yes_usd=None,
+                maker_fee_yes_usd=None,
+                taker_fee_no_usd=None,
+                maker_fee_no_usd=None,
+                features=None,
+                p_up=None,
+                error=f"skip:{reason} spot_source={spot_source}",
+            )
+
         feats = build_feature_dict(
-            price_to_beat=float(snap.price_to_beat),
-            btc_spot_usd=float(snap.btc_spot_usd),
+            price_to_beat=K,
+            btc_spot_usd=float(S),
             seconds_to_expiry=int(snap.seconds_to_expiry),
-            recent_closes_1m=closes,
+            recent_closes_1m=recent_closes_1m,
         )
         p_up = predict_probability(model, feature_names, feats)
 
@@ -245,6 +355,11 @@ async def infer_for_snapshot(
             ticker=snap.ticker,
             price_to_beat=snap.price_to_beat,
             btc_spot_usd=snap.btc_spot_usd,
+            proxy_spot_usd=float(S),
+            spot_source=str(spot_source),
+            coinbase_mid_usd=snap.coinbase_mid_usd,
+            coinbase_vwap_60s=snap.coinbase_vwap_60s,
+            coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
             seconds_to_expiry=snap.seconds_to_expiry,
 
             contracts=int(contracts),
@@ -263,6 +378,11 @@ async def infer_for_snapshot(
             ticker=snap.ticker,
             price_to_beat=snap.price_to_beat,
             btc_spot_usd=snap.btc_spot_usd,
+            proxy_spot_usd=proxy_spot_usd,
+            spot_source=str(spot_source) if spot_source is not None else None,
+            coinbase_mid_usd=getattr(snap, "coinbase_mid_usd", None),
+            coinbase_vwap_60s=getattr(snap, "coinbase_vwap_60s", None),
+            coinbase_vwap_age_ms=getattr(snap, "coinbase_vwap_age_ms", None),
             seconds_to_expiry=snap.seconds_to_expiry,
 
             contracts=int(contracts),
@@ -307,8 +427,16 @@ def main() -> None:
                     horizon_minutes=int(args.horizon_minutes),
                     limit_markets=int(args.limit_markets),
                 )
+
+                closes = await fetch_recent_1m_closes(limit=6)
                 results = [
-                    await infer_for_snapshot(model, feature_names, s, contracts=int(args.contracts))
+                    await infer_for_snapshot(
+                        model,
+                        feature_names,
+                        s,
+                        contracts=int(args.contracts),
+                        recent_closes_1m=closes,
+                    )
                     for s in snaps
                 ]
                 print(json.dumps([asdict(r) for r in results], indent=2, sort_keys=True))
@@ -322,8 +450,16 @@ def main() -> None:
                     horizon_minutes=int(args.horizon_minutes),
                     limit_markets=int(args.limit_markets),
                 )
+
+                closes = await fetch_recent_1m_closes(limit=6)
                 results = [
-                    await infer_for_snapshot(model, feature_names, s, contracts=int(args.contracts))
+                    await infer_for_snapshot(
+                        model,
+                        feature_names,
+                        s,
+                        contracts=int(args.contracts),
+                        recent_closes_1m=closes,
+                    )
                     for s in snaps
                 ]
                 print(json.dumps([asdict(r) for r in results], sort_keys=True))

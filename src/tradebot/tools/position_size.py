@@ -68,6 +68,7 @@ def calc_position_size(
     kelly_multiplier: float = 1.0,
     fee_per_contract_usd: float = 0.0,
     max_fraction: float = 1.0,
+    min_contracts_if_positive_edge: int = 1,
 ) -> PositionSize:
     """Calculate position size using (fractional) Kelly.
 
@@ -116,6 +117,15 @@ def calc_position_size(
             # Round down to avoid exceeding bankroll fraction.
             contracts = int(math.floor(stake_usd / eff_cost))
             contracts = max(0, contracts)
+
+            min_c = int(min_contracts_if_positive_edge)
+            if contracts == 0 and min_c > 0:
+                # Only allow a min-lot when full Kelly indicates true positive edge.
+                # Do not override when kelly_full_fraction <= 0.
+                if float(k_full) > 0:
+                    # Ensure we can afford the minimum lot.
+                    if br >= float(eff_cost) * float(min_c):
+                        contracts = min_c
 
     return PositionSize(
         side=str(side),

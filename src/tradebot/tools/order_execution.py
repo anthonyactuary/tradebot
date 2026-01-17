@@ -25,6 +25,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import httpx
+
 from tradebot.kalshi.client import KalshiClient
 from tradebot.tools.kalshi_fees import kalshi_expected_fee_usd
 from tradebot.tools.kalshi_market_poll import MarketSnapshot
@@ -98,6 +100,54 @@ class _PendingFlipReentry:
 
 
 _PENDING_FLIP_REENTRY_BY_TICKER: dict[str, _PendingFlipReentry] = {}
+
+
+# If Kalshi reports trading is paused, back off briefly to avoid spamming orders.
+_TRADING_PAUSED_UNTIL_TS: float | None = None
+_TRADING_PAUSED_BACKOFF_SECONDS = 60.0
+
+
+def _is_trading_paused_http_error(e: Exception) -> bool:
+    if not isinstance(e, httpx.HTTPStatusError):
+        return False
+    try:
+        if int(e.response.status_code) != 409:
+            return False
+    except Exception:
+        return False
+
+    # Best-effort parse Kalshi error payload:
+    # {"error":{"code":"trading_is_paused", ...}}
+    try:
+        payload = e.response.json()
+        code = ((payload or {}).get("error") or {}).get("code")
+        return str(code) == "trading_is_paused"
+    except Exception:
+        # Fall back to substring match.
+        try:
+            return "trading_is_paused" in (e.response.text or "")
+        except Exception:
+            return False
+
+
+def _set_trading_paused_backoff(*, ticker: str, reason: str) -> None:
+    global _TRADING_PAUSED_UNTIL_TS
+    now = float(time.time())
+    _TRADING_PAUSED_UNTIL_TS = float(now + float(_TRADING_PAUSED_BACKOFF_SECONDS))
+    log.warning(
+        "TRADING_PAUSED_BACKOFF %s reason=%s until_epoch=%.3f backoff_s=%.0f",
+        str(ticker),
+        str(reason),
+        float(_TRADING_PAUSED_UNTIL_TS),
+        float(_TRADING_PAUSED_BACKOFF_SECONDS),
+    )
+
+
+def _trading_paused_backoff_active() -> bool:
+    until = _TRADING_PAUSED_UNTIL_TS
+    if until is None:
+        return False
+    return float(time.time()) < float(until)
 
 
 def _sync_hold_timer_from_inventory(*, snap: MarketSnapshot, position: int) -> None:
@@ -432,28 +482,40 @@ async def _sell_to_flat(
 
     client_order_id = str(uuid.uuid4())
     if held_side == "YES":
+        try:
+            return await client.create_order(
+                ticker=snap.ticker,
+                side="yes",
+                action="sell",
+                count=int(close_qty),
+                order_type="limit",
+                yes_price=int(bid_cents),
+                client_order_id=client_order_id,
+                reduce_only=True,
+                time_in_force=time_in_force,
+            )
+        except Exception as e:
+            if _is_trading_paused_http_error(e):
+                _set_trading_paused_backoff(ticker=snap.ticker, reason="flatten_trading_is_paused")
+                return None
+            raise
+    try:
         return await client.create_order(
             ticker=snap.ticker,
-            side="yes",
+            side="no",
             action="sell",
             count=int(close_qty),
             order_type="limit",
-            yes_price=int(bid_cents),
+            no_price=int(bid_cents),
             client_order_id=client_order_id,
             reduce_only=True,
             time_in_force=time_in_force,
         )
-    return await client.create_order(
-        ticker=snap.ticker,
-        side="no",
-        action="sell",
-        count=int(close_qty),
-        order_type="limit",
-        no_price=int(bid_cents),
-        client_order_id=client_order_id,
-        reduce_only=True,
-        time_in_force=time_in_force,
-    )
+    except Exception as e:
+        if _is_trading_paused_http_error(e):
+            _set_trading_paused_backoff(ticker=snap.ticker, reason="flatten_trading_is_paused")
+            return None
+        raise
 
 
 def _risk_delta_contracts(*, side: Literal["YES", "NO"], qty: int) -> int:
@@ -539,6 +601,10 @@ async def place_order(
     """
 
     if decision.side is None:
+        return None
+
+    if _trading_paused_backoff_active():
+        log.info("TRADING_PAUSED_SKIP %s reason=backoff_active", snap.ticker)
         return None
 
     side: Side = "YES" if decision.side == "YES" else "NO"
@@ -1113,27 +1179,39 @@ async def place_order(
                 return None
 
     if side == "YES":
-        resp = await client.create_order(
-            ticker=snap.ticker,
-            side="yes",
-            action="buy",
-            count=int(qty),
-            order_type="limit",
-            yes_price=int(entry_price_cents),
-            client_order_id=client_order_id,
-            time_in_force=time_in_force_entry,
-        )
+        try:
+            resp = await client.create_order(
+                ticker=snap.ticker,
+                side="yes",
+                action="buy",
+                count=int(qty),
+                order_type="limit",
+                yes_price=int(entry_price_cents),
+                client_order_id=client_order_id,
+                time_in_force=time_in_force_entry,
+            )
+        except Exception as e:
+            if _is_trading_paused_http_error(e):
+                _set_trading_paused_backoff(ticker=snap.ticker, reason="entry_trading_is_paused")
+                return None
+            raise
     else:
-        resp = await client.create_order(
-            ticker=snap.ticker,
-            side="no",
-            action="buy",
-            count=int(qty),
-            order_type="limit",
-            no_price=int(entry_price_cents),
-            client_order_id=client_order_id,
-            time_in_force=time_in_force_entry,
-        )
+        try:
+            resp = await client.create_order(
+                ticker=snap.ticker,
+                side="no",
+                action="buy",
+                count=int(qty),
+                order_type="limit",
+                no_price=int(entry_price_cents),
+                client_order_id=client_order_id,
+                time_in_force=time_in_force_entry,
+            )
+        except Exception as e:
+            if _is_trading_paused_http_error(e):
+                _set_trading_paused_backoff(ticker=snap.ticker, reason="entry_trading_is_paused")
+                return None
+            raise
 
     order_id = _extract_order_id(resp)
     log.info("ORDER_ACK %s side=%s order_id=%s", snap.ticker, side, order_id or "?")

@@ -123,10 +123,10 @@ class TraderConfig:
     allow_reentry_after_flatten: bool = True
 
     # Risk limits (set to None to disable a specific limit)
-    max_total_abs_contracts: int | None = 5.0
-    max_total_exposure_usd: float | None = 5.0
-    max_ticker_abs_contracts: int | None = 5.0
-    max_ticker_exposure_usd: float | None = 5.0
+    max_total_abs_contracts: int | None = 7.0
+    max_total_exposure_usd: float | None = 7.0
+    max_ticker_abs_contracts: int | None = 7.0
+    max_ticker_exposure_usd: float | None = 7.0
 
 CONFIG = TraderConfig()
 
