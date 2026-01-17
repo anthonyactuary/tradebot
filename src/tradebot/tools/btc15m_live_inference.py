@@ -59,6 +59,8 @@ class InferenceResult:
     coinbase_mid_usd: float | None
     coinbase_vwap_60s: float | None
     coinbase_vwap_age_ms: int | None
+    kraken_mid_usd: float | None
+    composite_mid_usd: float | None
     seconds_to_expiry: int | None
 
     contracts: int | None
@@ -75,9 +77,14 @@ class InferenceResult:
 def choose_proxy_spot_usd(snap: MarketSnapshot) -> tuple[float | None, str]:
     """Pick the spot proxy used for delta.
 
-    Near expiry, prefer a fresh rolling trade VWAP; otherwise fall back to Coinbase ticker.
+    Priority:
+    1. Near expiry (≤60s): Coinbase VWAP (if fresh and has enough trades)
+    2. Composite mid (Coinbase + Kraken average) - best BRTI approximation
+    3. Coinbase mid alone
+    4. Coinbase ticker (fallback)
     """
 
+    # Near expiry: use VWAP for best settlement alignment
     if (
         snap.seconds_to_expiry is not None
         and int(snap.seconds_to_expiry) <= 60
@@ -88,6 +95,11 @@ def choose_proxy_spot_usd(snap: MarketSnapshot) -> tuple[float | None, str]:
     ):
         return (float(snap.coinbase_vwap_60s), "vwap_60s")
 
+    # Prefer composite mid (Coinbase + Kraken) for better BRTI approximation
+    if hasattr(snap, "composite_mid_usd") and snap.composite_mid_usd is not None:
+        return (float(snap.composite_mid_usd), "composite_mid")
+
+    # Fall back to Coinbase mid alone
     if snap.coinbase_mid_usd is not None:
         return (float(snap.coinbase_mid_usd), "coinbase_mid")
 
@@ -282,6 +294,8 @@ async def infer_for_snapshot(
                 coinbase_mid_usd=snap.coinbase_mid_usd,
                 coinbase_vwap_60s=snap.coinbase_vwap_60s,
                 coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                kraken_mid_usd=getattr(snap, "kraken_mid_usd", None),
+                composite_mid_usd=getattr(snap, "composite_mid_usd", None),
                 seconds_to_expiry=snap.seconds_to_expiry,
                 contracts=int(contracts),
                 taker_fee_yes_usd=None,
@@ -306,6 +320,8 @@ async def infer_for_snapshot(
                 coinbase_mid_usd=snap.coinbase_mid_usd,
                 coinbase_vwap_60s=snap.coinbase_vwap_60s,
                 coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                kraken_mid_usd=getattr(snap, "kraken_mid_usd", None),
+                composite_mid_usd=getattr(snap, "composite_mid_usd", None),
                 seconds_to_expiry=snap.seconds_to_expiry,
                 contracts=int(contracts),
                 taker_fee_yes_usd=None,
@@ -330,6 +346,8 @@ async def infer_for_snapshot(
                 coinbase_mid_usd=snap.coinbase_mid_usd,
                 coinbase_vwap_60s=snap.coinbase_vwap_60s,
                 coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+                kraken_mid_usd=getattr(snap, "kraken_mid_usd", None),
+                composite_mid_usd=getattr(snap, "composite_mid_usd", None),
                 seconds_to_expiry=snap.seconds_to_expiry,
                 contracts=int(contracts),
                 taker_fee_yes_usd=None,
@@ -360,6 +378,8 @@ async def infer_for_snapshot(
             coinbase_mid_usd=snap.coinbase_mid_usd,
             coinbase_vwap_60s=snap.coinbase_vwap_60s,
             coinbase_vwap_age_ms=snap.coinbase_vwap_age_ms,
+            kraken_mid_usd=getattr(snap, "kraken_mid_usd", None),
+            composite_mid_usd=getattr(snap, "composite_mid_usd", None),
             seconds_to_expiry=snap.seconds_to_expiry,
 
             contracts=int(contracts),
@@ -383,6 +403,8 @@ async def infer_for_snapshot(
             coinbase_mid_usd=getattr(snap, "coinbase_mid_usd", None),
             coinbase_vwap_60s=getattr(snap, "coinbase_vwap_60s", None),
             coinbase_vwap_age_ms=getattr(snap, "coinbase_vwap_age_ms", None),
+            kraken_mid_usd=getattr(snap, "kraken_mid_usd", None),
+            composite_mid_usd=getattr(snap, "composite_mid_usd", None),
             seconds_to_expiry=snap.seconds_to_expiry,
 
             contracts=int(contracts),

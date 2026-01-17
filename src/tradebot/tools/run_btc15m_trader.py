@@ -106,7 +106,9 @@ class TraderConfig:
 
     # Execution gates (anti-churn)
     min_hold_seconds: int = 300
-    min_entry_edge: float = 0.025
+    min_entry_edge: float = 0.025  # EV threshold when TTE >= entry_edge_tte_threshold
+    min_entry_edge_late: float = 0.05  # EV threshold when TTE < entry_edge_tte_threshold
+    entry_edge_tte_threshold: int = 300  # 5 minutes in seconds
     dead_zone: float = 0.05
     exit_delta: float = 0.10
     catastrophic_exit_delta: float = 0.18
@@ -298,6 +300,8 @@ async def _run_once(
                 maker_improve_cents=int(cfg.maker_improve_cents),
                 min_seconds_between_entry_orders=int(cfg.min_seconds_between_entry_orders),
                 min_entry_edge=float(cfg.min_entry_edge),
+                min_entry_edge_late=float(cfg.min_entry_edge_late),
+                entry_edge_tte_threshold=int(cfg.entry_edge_tte_threshold),
                 dead_zone=float(cfg.dead_zone),
                 exit_delta=float(cfg.exit_delta),
                 catastrophic_exit_delta=float(cfg.catastrophic_exit_delta),

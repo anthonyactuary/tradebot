@@ -37,6 +37,8 @@ COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker
 COINBASE_TRADES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/trades"
 COINBASE_BOOK_URL = "https://api.exchange.coinbase.com/products/BTC-USD/book"
 
+KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +139,53 @@ async def fetch_coinbase_best_bid_ask() -> tuple[float | None, float | None, flo
     except Exception as e:
         log.warning("COINBASE_BOOK_ERROR error=%s", e)
         return (None, None, None)
+
+
+async def fetch_kraken_best_bid_ask() -> tuple[float | None, float | None, float | None]:
+    """Fetch top-of-book bid/ask for BTC-USD from Kraken and return (bid, ask, mid)."""
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(KRAKEN_TICKER_URL, params={"pair": "XBTUSD"})
+            resp.raise_for_status()
+            data = resp.json()
+
+        if data.get("error"):
+            log.warning("KRAKEN_API_ERROR errors=%s", data["error"])
+            return (None, None, None)
+
+        result = data.get("result", {}).get("XXBTZUSD", {})
+
+        # Kraken format: "a" = [ask_price, whole_lot_volume, lot_volume]
+        #                "b" = [bid_price, whole_lot_volume, lot_volume]
+        ask_data = result.get("a", [])
+        bid_data = result.get("b", [])
+
+        best_ask = float(ask_data[0]) if ask_data else None
+        best_bid = float(bid_data[0]) if bid_data else None
+
+        mid: float | None = None
+        if best_bid is not None and best_ask is not None:
+            mid = (float(best_bid) + float(best_ask)) / 2.0
+
+        return (best_bid, best_ask, mid)
+    except Exception as e:
+        log.warning("KRAKEN_BOOK_ERROR error=%s", e)
+        return (None, None, None)
+
+
+def compute_composite_mid(coinbase_mid: float | None, kraken_mid: float | None) -> float | None:
+    """Compute composite mid from available exchange mids.
+    
+    Simple average when both are available, fall back to single source otherwise.
+    """
+    if coinbase_mid is not None and kraken_mid is not None:
+        return (coinbase_mid + kraken_mid) / 2.0
+    if coinbase_mid is not None:
+        return coinbase_mid
+    if kraken_mid is not None:
+        return kraken_mid
+    return None
 
 
 def _utcnow() -> dt.datetime:
@@ -270,6 +319,14 @@ class MarketSnapshot:
     coinbase_vwap_count: int
     coinbase_vwap_age_ms: int | None
 
+    # Kraken L1 orderbook
+    kraken_best_bid: float | None
+    kraken_best_ask: float | None
+    kraken_mid_usd: float | None
+
+    # Composite mid (Coinbase + Kraken average)
+    composite_mid_usd: float | None
+
     # Timing
     seconds_to_expiry: int | None
     cutoff_time_utc_iso: str | None
@@ -338,19 +395,30 @@ async def pick_active_markets(
     limit_markets: int = 2,
     min_seconds_to_expiry: int = 0,
 ) -> list[dict[str, Any]]:
-    """Pick currently-open BTC 15-minute markets expiring soon."""
+    """Pick currently-tradeable BTC 15-minute markets expiring soon.
+
+    Note: KXBTC15M markets have status="active" when tradeable, but the API
+    status filter only accepts "open", "closed", "settled". We query without
+    status filter and filter client-side for tradeable statuses.
+    """
     now = _utcnow()
     horizon = dt.timedelta(minutes=int(horizon_minutes))
 
     series_ticker = f"KX{asset.upper()}15M"
+
+    # Query without status filter - API status filter doesn't include "active"
+    # which is what KXBTC15M markets use when tradeable
     page = await client.get_markets_page(
         limit=100,
-        status="open",
         series_ticker=series_ticker,
         mve_filter="exclude",
     )
 
-    markets = list(page.get("markets", []) or [])
+    all_markets = list(page.get("markets", []) or [])
+
+    # Filter for tradeable statuses (open or active)
+    tradeable_statuses = {"open", "active"}
+    markets = [m for m in all_markets if m.get("status") in tradeable_statuses]
 
     valid: list[tuple[dt.datetime, dict[str, Any]]] = []
     for m in markets:
@@ -380,6 +448,9 @@ async def fetch_snapshot_for_market(
     coinbase_vwap_60s: float | None,
     coinbase_vwap_count: int,
     coinbase_vwap_age_ms: int | None,
+    kraken_best_bid: float | None,
+    kraken_best_ask: float | None,
+    kraken_mid_usd: float | None,
 ) -> MarketSnapshot:
     now = _utcnow()
     ticker = str(market.get("ticker") or "").strip()
@@ -414,6 +485,10 @@ async def fetch_snapshot_for_market(
         coinbase_vwap_60s=coinbase_vwap_60s,
         coinbase_vwap_count=int(coinbase_vwap_count),
         coinbase_vwap_age_ms=coinbase_vwap_age_ms,
+        kraken_best_bid=kraken_best_bid,
+        kraken_best_ask=kraken_best_ask,
+        kraken_mid_usd=kraken_mid_usd,
+        composite_mid_usd=compute_composite_mid(coinbase_mid_usd, kraken_mid_usd),
         seconds_to_expiry=seconds_to_expiry,
         cutoff_time_utc_iso=cutoff_iso,
         cutoff_time_source=cutoff_field,
@@ -441,6 +516,9 @@ async def _safe_fetch_snapshot_for_market(
     coinbase_vwap_60s: float | None,
     coinbase_vwap_count: int,
     coinbase_vwap_age_ms: int | None,
+    kraken_best_bid: float | None,
+    kraken_best_ask: float | None,
+    kraken_mid_usd: float | None,
 ) -> MarketSnapshot | None:
     ticker = str(market.get("ticker") or "").strip()
     try:
@@ -454,6 +532,9 @@ async def _safe_fetch_snapshot_for_market(
             coinbase_vwap_60s=coinbase_vwap_60s,
             coinbase_vwap_count=coinbase_vwap_count,
             coinbase_vwap_age_ms=coinbase_vwap_age_ms,
+            kraken_best_bid=kraken_best_bid,
+            kraken_best_ask=kraken_best_ask,
+            kraken_mid_usd=kraken_mid_usd,
         )
     except Exception as e:
         # Treat per-market failures as transient and skip that market for this poll.
@@ -524,6 +605,15 @@ async def poll_once(
         vwap_age_ms = max(0, int(raw_age))
 
     cb_bid, cb_ask, cb_mid = await fetch_coinbase_best_bid_ask()
+    kr_bid, kr_ask, kr_mid = await fetch_kraken_best_bid_ask()
+    composite_mid = compute_composite_mid(cb_mid, kr_mid)
+    log.info(
+        "EXCHANGE_PRICES cb_mid=%s kr_mid=%s composite=%s diff=%s",
+        "-" if cb_mid is None else f"{float(cb_mid):.2f}",
+        "-" if kr_mid is None else f"{float(kr_mid):.2f}",
+        "-" if composite_mid is None else f"{float(composite_mid):.2f}",
+        "-" if cb_mid is None or kr_mid is None else f"{float(cb_mid - kr_mid):+.2f}",
+    )
     log.info(
         "COINBASE_VWAP now_ms=%d now_ms_local=%d trades_ingested=%d vwap_count=%d vwap_60s=%s vwap_age_ms=%s cb_bid=%s cb_ask=%s cb_mid=%s",
         int(safe_now_ms),
@@ -561,6 +651,9 @@ async def poll_once(
                 coinbase_vwap_60s=vwap_60s,
                 coinbase_vwap_count=vwap_count,
                 coinbase_vwap_age_ms=vwap_age_ms,
+                kraken_best_bid=kr_bid,
+                kraken_best_ask=kr_ask,
+                kraken_mid_usd=kr_mid,
             )
             for m in markets
         )

@@ -582,6 +582,8 @@ async def place_order(
     maker_improve_cents: int = 0,
     min_seconds_between_entry_orders: int = 20,
     min_entry_edge: float = 0.025,
+    min_entry_edge_late: float = 0.05,
+    entry_edge_tte_threshold: int = 300,
     dead_zone: float = 0.05,
     exit_delta: float = 0.09,
     catastrophic_exit_delta: float = 0.20,
@@ -734,21 +736,21 @@ async def place_order(
     if qty <= 0:
         return None
 
-    # Maker-only entry guardrails (only for entry buys; flatten/exit remains unchanged).
-    # NOTE: This function only places BUY entry orders and SELL reduce-only flatten orders.
-    if str(entry_mode) == "maker_only":
-        # Prevent spamming maker entry attempts every poll.
+    # Rate-limit entry orders to prevent spam (applies to all entry modes).
+    # Only applies to fresh entries; flatten/exit are not rate-limited.
+    if min_seconds_between_entry_orders > 0:
         now_ts = time.time()
         last_ts = _LAST_ENTRY_ORDER_TS_BY_TICKER.get(snap.ticker)
         if last_ts is not None and (now_ts - float(last_ts)) < float(min_seconds_between_entry_orders):
             log.info(
-                "ENTRY_RATE_BLOCK %s mode=maker_only since_last=%.1fs < min_seconds_between_entry_orders=%ss",
+                "ENTRY_RATE_BLOCK %s mode=%s since_last=%.1fs < min_seconds_between_entry_orders=%ss",
                 snap.ticker,
+                str(entry_mode),
                 float(now_ts - float(last_ts)),
                 str(int(min_seconds_between_entry_orders)),
             )
             log.info(
-                "ORDER_BLOCK %s side=%s reason_block=maker_rate_limit",
+                "ORDER_BLOCK %s side=%s reason_block=entry_rate_limit",
                 snap.ticker,
                 str(side),
                 extra={
@@ -757,13 +759,16 @@ async def place_order(
                         "poll_id": poll_id if poll_id is not None else "",
                         "ticker": snap.ticker,
                         "side": str(side),
-                        "reason": "maker_rate_limit",
+                        "reason": "entry_rate_limit",
                         "mode": str(entry_mode),
                     }
                 },
             )
             return None
 
+    # Maker-only entry guardrails (only for entry buys; flatten/exit remains unchanged).
+    # NOTE: This function only places BUY entry orders and SELL reduce-only flatten orders.
+    if str(entry_mode) == "maker_only":
         # "Single position only": do not place a second entry if we already have any position.
         tickers_for_inv = risk_tickers if risk_tickers is not None else [snap.ticker]
         inv_for_entry = inventory if inventory is not None else await fetch_inventory_summary(client=client, tickers=tickers_for_inv)
@@ -933,11 +938,10 @@ async def place_order(
                     # after flip-flatten and then hold that new position until expiry.
                     if did_flatten and not bool(allow_reentry_after_flatten):
                         log.info(
-                            "FLATTEN_ONLY %s want=%s reason=no_reentry_after_flatten ev_after_fees=%.4f min_entry_edge=%.4f",
+                            "FLATTEN_ONLY %s want=%s reason=no_reentry_after_flatten ev_after_fees=%.4f",
                             snap.ticker,
                             side,
                             float(ev_new_side_after_fees),
-                            float(min_entry_edge),
                         )
                         return None
 
@@ -1036,13 +1040,22 @@ async def place_order(
 
     # Entry gate: don't open fresh positions when model ~= market.
     # Applies to opening/adding positions; does not apply to flattening.
-    if (not did_flatten or allow_entry_post_flatten) and float(ev_new_side_after_fees) <= float(min_entry_edge):
+    # Use TTE-based dynamic threshold: require higher edge near expiry.
+    tte_for_edge = snap.seconds_to_expiry if snap.seconds_to_expiry is not None else 9999
+    effective_min_entry_edge = (
+        float(min_entry_edge_late)
+        if int(tte_for_edge) < int(entry_edge_tte_threshold)
+        else float(min_entry_edge)
+    )
+    if (not did_flatten or allow_entry_post_flatten) and float(ev_new_side_after_fees) <= effective_min_entry_edge:
         log.info(
-            "ENTRY_BLOCK %s side=%s ev_after_fees=%.4f <= min_entry_edge=%.4f",
+            "ENTRY_BLOCK %s side=%s ev_after_fees=%.4f <= min_entry_edge=%.4f (tte=%ds threshold=%ds)",
             snap.ticker,
             side,
             float(ev_new_side_after_fees),
-            float(min_entry_edge),
+            effective_min_entry_edge,
+            int(tte_for_edge),
+            int(entry_edge_tte_threshold),
         )
         log.info(
             "ORDER_BLOCK %s side=%s reason_block=min_entry_edge",
@@ -1056,6 +1069,8 @@ async def place_order(
                     "side": str(side),
                     "reason": "min_entry_edge",
                     "ev_after_fees": float(ev_new_side_after_fees),
+                    "effective_min_entry_edge": effective_min_entry_edge,
+                    "tte_s": int(tte_for_edge),
                 }
             },
         )
@@ -1241,14 +1256,13 @@ async def place_order(
 
     if bool(flip_reentry):
         log.info(
-            "REENTRY_AFTER_FLATTEN %s from=%s to=%s qty=%d @ %dc EV_after_fees=%.4f min_entry_edge=%.4f hold_to_expiry=true",
+            "REENTRY_AFTER_FLATTEN %s from=%s to=%s qty=%d @ %dc EV_after_fees=%.4f hold_to_expiry=true",
             snap.ticker,
             "?" if flip_from_side is None else str(flip_from_side),
             str(side),
             int(qty),
             int(entry_price_cents),
             float(ev_per_contract),
-            float(min_entry_edge),
         )
 
     log.info(
@@ -1271,8 +1285,9 @@ async def place_order(
     )
 
     if dry_run:
+        # Update rate limit timestamp for all entry modes
+        _LAST_ENTRY_ORDER_TS_BY_TICKER[snap.ticker] = float(time.time())
         if str(entry_mode) == "maker_only":
-            _LAST_ENTRY_ORDER_TS_BY_TICKER[snap.ticker] = float(time.time())
             # Simulate cancel/replace semantics: ensure only one open entry order per ticker.
             _OPEN_ENTRY_ORDER_ID_BY_TICKER[snap.ticker] = str(
                 f"dry-open-{snap.ticker}-{int(time.time()*1000)}"
@@ -1296,9 +1311,10 @@ async def place_order(
 
     client_order_id = str(uuid.uuid4())
 
-    if str(entry_mode) == "maker_only":
-        _LAST_ENTRY_ORDER_TS_BY_TICKER[snap.ticker] = float(time.time())
+    # Update rate limit timestamp for all entry modes
+    _LAST_ENTRY_ORDER_TS_BY_TICKER[snap.ticker] = float(time.time())
 
+    if str(entry_mode) == "maker_only":
         # Cancel/replace: if we already have a tracked open maker entry order,
         # cancel it before placing a new one so we don't stack GTC orders.
         open_id = _OPEN_ENTRY_ORDER_ID_BY_TICKER.get(snap.ticker)
