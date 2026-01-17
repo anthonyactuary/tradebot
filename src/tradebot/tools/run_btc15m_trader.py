@@ -26,6 +26,7 @@ import datetime as dt
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
@@ -62,7 +63,7 @@ FeeMode = Literal["maker", "taker"]
 @dataclass(frozen=True)
 class TraderConfig:
     # Model
-    model_dir: str = "src/tradebot/data/btc15m_model_coinbase_80d_purged30"
+    model_dir: str = "src/tradebot/data/btc15m_model_coinbase_83d_purged30"
 
     # Polling
     live: bool = True
@@ -143,7 +144,15 @@ def _trade_ev_after_fees(signal: TradeSignal) -> float | None:
     return float(signal.edge.ev_no_after_fees)
 
 
-async def _run_once(*, client: KalshiClient, model: object, feature_names: list[str], cfg: TraderConfig) -> None:
+async def _run_once(
+    *,
+    client: KalshiClient,
+    model: object,
+    feature_names: list[str],
+    cfg: TraderConfig,
+    run_id: str,
+    poll_id: int,
+) -> None:
     try:
         snaps: list[MarketSnapshot] = await poll_once(
             client,
@@ -207,6 +216,45 @@ async def _run_once(*, client: KalshiClient, model: object, feature_names: list[
         # Use logging so it also gets captured by CSV logs.
         log.info(_to_pretty_line(sig))
 
+        # Structured row for later calibration / dataset generation.
+        # Keep this separate from the human-readable line above.
+        decision_side = sig.decision.side if sig.decision is not None else None
+        contracts = sig.position.contracts if (sig.position is not None and sig.position.contracts is not None) else None
+        kelly_fraction = float(sig.position.kelly_fraction) if sig.position is not None else None
+        log.info(
+            "PRED_SNAPSHOT %s",
+            s.ticker,
+            extra={
+                "csv_fields": {
+                    "run_id": str(run_id),
+                    "poll_id": int(poll_id),
+                    "ticker": str(s.ticker),
+                    "decision": decision_side,
+                    "qty": contracts,
+                    "kelly_fraction": kelly_fraction,
+                    "spot_usd": sig.proxy_spot_usd,
+                    "strike_usd": sig.price_to_beat,
+                    "strike_src": (s.price_to_beat_source or sig.spot_source or "?"),
+                    "tte_s": sig.seconds_to_expiry,
+                    "p_yes": sig.p_yes,
+                    "p_no": sig.p_no,
+                    "market_p_yes": sig.market_p_yes,
+                    "market_p_no": sig.market_p_no,
+                    "fee_assumption": str(cfg.fee_mode),
+                    "error": sig.error,
+                    "error_type": ("signal_error" if sig.error else ""),
+                    # Leave additional fields for JSON fallback.
+                    "spot_source": sig.spot_source,
+                    "coinbase_mid_usd": getattr(s, "coinbase_mid_usd", None),
+                    "coinbase_best_bid": getattr(s, "coinbase_best_bid", None),
+                    "coinbase_best_ask": getattr(s, "coinbase_best_ask", None),
+                    "coinbase_vwap_60s": getattr(s, "coinbase_vwap_60s", None),
+                    "coinbase_vwap_count": getattr(s, "coinbase_vwap_count", None),
+                    "coinbase_vwap_age_ms": getattr(s, "coinbase_vwap_age_ms", None),
+                }
+            },
+        )
+
     if not cfg.enable_execution:
         return
 
@@ -235,6 +283,8 @@ async def _run_once(*, client: KalshiClient, model: object, feature_names: list[
                 decision=sig.decision,  # type: ignore[arg-type]
                 edge=sig.edge,  # type: ignore[arg-type]
                 position=sig.position,
+                run_id=str(run_id),
+                poll_id=int(poll_id),
                 max_seconds_to_expiry=(
                     int(cfg.max_seconds_to_expiry_to_trade)
                     if cfg.max_seconds_to_expiry_to_trade is not None
@@ -283,12 +333,13 @@ def main() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     csv_handler = None
+    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     if bool(CONFIG.csv_log_enabled):
-        path = str(CONFIG.csv_log_path) if CONFIG.csv_log_path else default_live_csv_log_path(prefix="btc15m_live")
+        path = str(CONFIG.csv_log_path) if CONFIG.csv_log_path else default_live_csv_log_path(prefix="btc15m_live_v2")
         # Ensure runs/ exists if user provided a relative path under it.
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         csv_handler = install_csv_log_handler(path=path, level=logging.INFO)
-        log.info("CSV_LOG enabled path=%s", path)
+        log.info("CSV_LOG enabled path=%s run_id=%s", path, str(run_id))
 
     model, feature_names = load_model(str(CONFIG.model_dir))
 
@@ -297,19 +348,28 @@ def main() -> None:
         client = KalshiClient.from_settings(settings)
         try:
             if not CONFIG.live:
-                await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG)
+                await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG, run_id=str(run_id), poll_id=0)
                 return
 
             start = _utcnow().timestamp()
+            poll_id = 0
             while True:
                 if CONFIG.duration_seconds and CONFIG.duration_seconds > 0:
                     if (_utcnow().timestamp() - start) >= float(CONFIG.duration_seconds):
                         break
 
                 try:
-                    await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG)
+                    await _run_once(
+                        client=client,
+                        model=model,
+                        feature_names=feature_names,
+                        cfg=CONFIG,
+                        run_id=str(run_id),
+                        poll_id=int(poll_id),
+                    )
                 except Exception:
                     log.exception("RUN_ONCE_ERROR")
+                poll_id += 1
                 await asyncio.sleep(max(0.1, float(CONFIG.poll_seconds)))
         finally:
             await client.aclose()

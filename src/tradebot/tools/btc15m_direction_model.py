@@ -544,6 +544,134 @@ def train_model(
     return model, meta
 
 
+def tune_model_random_search(
+    train: DatasetBundle,
+    val: DatasetBundle,
+    *,
+    seed: int = 7,
+    trials: int = 40,
+    early_stopping_rounds: int = 50,
+    max_estimators: int = 8000,
+) -> tuple[Any, dict[str, Any]]:
+    """Random-search hyperparameter tuning for XGBoost (or LightGBM fallback).
+
+    Returns the best model and metadata including all trial results.
+    """
+    np, _pd, metrics = _require_numpy_pandas_sklearn()
+    backend, booster = _try_import_booster()
+
+    rng = np.random.default_rng(seed)
+
+    # Define search space
+    param_space = {
+        "learning_rate": [0.01, 0.02, 0.03, 0.05, 0.08, 0.1],
+        "max_depth": [3, 4, 5, 6, 7, 8],
+        "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+        "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+        "reg_lambda": [0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+        "min_child_weight": [1, 2, 3, 5, 10],
+        "gamma": [0.0, 0.1, 0.2, 0.5, 1.0],
+    }
+
+    best_model = None
+    best_logloss = float("inf")
+    best_params: dict[str, Any] = {}
+    trial_results: list[dict[str, Any]] = []
+
+    print(f"Starting hyperparameter tuning: {trials} trials...")
+
+    for trial_idx in range(trials):
+        # Sample random params
+        params = {k: rng.choice(v) for k, v in param_space.items()}
+
+        if backend == "xgboost":
+            xgb = booster
+            model = xgb.XGBClassifier(
+                n_estimators=max_estimators,
+                learning_rate=float(params["learning_rate"]),
+                max_depth=int(params["max_depth"]),
+                subsample=float(params["subsample"]),
+                colsample_bytree=float(params["colsample_bytree"]),
+                reg_lambda=float(params["reg_lambda"]),
+                min_child_weight=int(params["min_child_weight"]),
+                gamma=float(params["gamma"]),
+                objective="binary:logistic",
+                eval_metric="logloss",
+                early_stopping_rounds=early_stopping_rounds,
+                random_state=seed,
+                tree_method="hist",
+            )
+            model.fit(
+                train.X,
+                train.y,
+                eval_set=[(val.X, val.y)],
+                verbose=False,
+            )
+            best_iter = int(getattr(model, "best_iteration", -1) or -1)
+        else:
+            # LightGBM fallback
+            lgb = booster
+            # Map params for LightGBM
+            model = lgb.LGBMClassifier(
+                n_estimators=max_estimators,
+                learning_rate=float(params["learning_rate"]),
+                max_depth=int(params["max_depth"]),
+                num_leaves=min(31, 2 ** int(params["max_depth"]) - 1),
+                subsample=float(params["subsample"]),
+                colsample_bytree=float(params["colsample_bytree"]),
+                reg_lambda=float(params["reg_lambda"]),
+                min_child_weight=int(params["min_child_weight"]),
+                objective="binary",
+                random_state=seed,
+            )
+            model.fit(
+                train.X,
+                train.y,
+                eval_set=[(val.X, val.y)],
+                eval_metric="binary_logloss",
+                callbacks=[lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)],
+            )
+            best_iter = int(getattr(model, "best_iteration_", -1) or -1)
+
+        # Evaluate
+        p_val = model.predict_proba(val.X)[:, 1]
+        logloss = float(metrics.log_loss(val.y, p_val, labels=[0, 1]))
+        accuracy = float(metrics.accuracy_score(val.y, (p_val >= 0.5).astype(int)))
+        roc_auc = float(metrics.roc_auc_score(val.y, p_val))
+
+        trial_result = {
+            "trial": trial_idx,
+            "params": {k: float(v) if isinstance(v, (float, np.floating)) else int(v) for k, v in params.items()},
+            "logloss": logloss,
+            "accuracy": accuracy,
+            "roc_auc": roc_auc,
+            "best_iteration": best_iter,
+        }
+        trial_results.append(trial_result)
+
+        if logloss < best_logloss:
+            best_logloss = logloss
+            best_model = model
+            best_params = dict(params)
+            print(f"  Trial {trial_idx + 1}/{trials}: NEW BEST logloss={logloss:.5f} acc={accuracy:.4f} auc={roc_auc:.4f}")
+        else:
+            if (trial_idx + 1) % 10 == 0:
+                print(f"  Trial {trial_idx + 1}/{trials}: logloss={logloss:.5f} (best so far: {best_logloss:.5f})")
+
+    print(f"Tuning complete. Best logloss: {best_logloss:.5f}")
+
+    meta = {
+        "backend": backend,
+        "tuned": True,
+        "trials": trials,
+        "best_params": {k: float(v) if isinstance(v, (float, np.floating)) else int(v) for k, v in best_params.items()},
+        "best_logloss": float(best_logloss),
+        "best_iteration": int(getattr(best_model, "best_iteration", -1) if backend == "xgboost" else getattr(best_model, "best_iteration_", -1) or -1),
+        "trial_results": trial_results,
+    }
+    return best_model, meta
+
+
 def calibration_data(
     y_true: "np.ndarray",
     p_pred: "np.ndarray",

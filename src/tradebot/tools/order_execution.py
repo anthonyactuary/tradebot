@@ -572,6 +572,8 @@ async def place_order(
     decision: TradeDecision,
     edge: EdgeResult,
     position: PositionSize | None,
+    run_id: str | None = None,
+    poll_id: int | None = None,
     max_seconds_to_expiry: int | None = None,
     enable_flip: bool = True,
     min_hold_seconds: int = 120,
@@ -605,6 +607,20 @@ async def place_order(
 
     if _trading_paused_backoff_active():
         log.info("TRADING_PAUSED_SKIP %s reason=backoff_active", snap.ticker)
+        log.info(
+            "ORDER_BLOCK %s side=%s reason_block=trading_paused_backoff",
+            snap.ticker,
+            str(decision.side),
+            extra={
+                "csv_fields": {
+                    "run_id": run_id or "",
+                    "poll_id": poll_id if poll_id is not None else "",
+                    "ticker": snap.ticker,
+                    "side": str(decision.side),
+                    "reason": "trading_paused_backoff",
+                }
+            },
+        )
         return None
 
     side: Side = "YES" if decision.side == "YES" else "NO"
@@ -664,6 +680,21 @@ async def place_order(
             float(until or 0.0),
             "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
         )
+        log.info(
+            "ORDER_BLOCK %s side=%s reason_block=reentry_after_flatten",
+            snap.ticker,
+            str(side),
+            extra={
+                "csv_fields": {
+                    "run_id": run_id or "",
+                    "poll_id": poll_id if poll_id is not None else "",
+                    "ticker": snap.ticker,
+                    "side": str(side),
+                    "reason": "reentry_after_flatten",
+                    "tte_s": snap.seconds_to_expiry,
+                }
+            },
+        )
         return None
 
     # If a pending flip re-entry exists, only allow entry for the intended side.
@@ -673,6 +704,20 @@ async def place_order(
             snap.ticker,
             str(side),
             str(pending.to_side),
+        )
+        log.info(
+            "ORDER_BLOCK %s side=%s reason_block=pending_flip_side_mismatch",
+            snap.ticker,
+            str(side),
+            extra={
+                "csv_fields": {
+                    "run_id": run_id or "",
+                    "poll_id": poll_id if poll_id is not None else "",
+                    "ticker": snap.ticker,
+                    "side": str(side),
+                    "reason": "pending_flip_side_mismatch",
+                }
+            },
         )
         return None
 
@@ -702,6 +747,21 @@ async def place_order(
                 float(now_ts - float(last_ts)),
                 str(int(min_seconds_between_entry_orders)),
             )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=maker_rate_limit",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": "maker_rate_limit",
+                        "mode": str(entry_mode),
+                    }
+                },
+            )
             return None
 
         # "Single position only": do not place a second entry if we already have any position.
@@ -728,6 +788,21 @@ async def place_order(
                         e,
                     )
             log.info("ENTRY_POSITION_BLOCK %s mode=maker_only cur_pos=%d", snap.ticker, int(cur_pos_entry))
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=maker_position_exists",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": "maker_position_exists",
+                        "mode": str(entry_mode),
+                    }
+                },
+            )
             return None
 
     # Flip handling (do not open opposite-side while still holding current).
@@ -895,6 +970,25 @@ async def place_order(
                 float(max_spot_strike_deviation_fraction) * 100.0,
                 str(snap.price_to_beat_source or "?"),
             )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=spot_strike_deviation",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": "spot_strike_deviation",
+                        "spot_usd": snap.btc_spot_usd,
+                        "strike_usd": snap.price_to_beat,
+                        "strike_src": str(snap.price_to_beat_source or "?"),
+                        "diff_pct": float(diff) * 100.0,
+                        "max_pct": float(max_spot_strike_deviation_fraction) * 100.0,
+                    }
+                },
+            )
             return None
 
     # Dead-zone guardrail: block fresh entries when model is near a coin flip.
@@ -920,6 +1014,24 @@ async def place_order(
                 float(edge.market_p_no),
                 float(ev_new_side_after_fees),
             )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=deadzone",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": "deadzone",
+                        "p_yes": edge.p_yes,
+                        "p_no": edge.p_no,
+                        "market_p_yes": edge.market_p_yes,
+                        "market_p_no": edge.market_p_no,
+                    }
+                },
+            )
             return None
 
     # Entry gate: don't open fresh positions when model ~= market.
@@ -931,6 +1043,21 @@ async def place_order(
             side,
             float(ev_new_side_after_fees),
             float(min_entry_edge),
+        )
+        log.info(
+            "ORDER_BLOCK %s side=%s reason_block=min_entry_edge",
+            snap.ticker,
+            str(side),
+            extra={
+                "csv_fields": {
+                    "run_id": run_id or "",
+                    "poll_id": poll_id if poll_id is not None else "",
+                    "ticker": snap.ticker,
+                    "side": str(side),
+                    "reason": "min_entry_edge",
+                    "ev_after_fees": float(ev_new_side_after_fees),
+                }
+            },
         )
         return None
 
@@ -1081,6 +1208,23 @@ async def place_order(
                 int(ask_cents),
                 reason,
             )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=risk_limits",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "qty": int(qty),
+                        "price_cents": int(entry_price_cents),
+                        "price_dollars": float(entry_price_dollars),
+                        "reason": f"risk_limits:{reason}",
+                    }
+                },
+            )
             return None
 
     fee_total_usd = kalshi_expected_fee_usd(
@@ -1176,7 +1320,55 @@ async def place_order(
                     str(open_id),
                     e,
                 )
+                log.info(
+                    "ORDER_BLOCK %s side=%s reason_block=entry_cancel_replace_failed",
+                    snap.ticker,
+                    str(side),
+                    extra={
+                        "csv_fields": {
+                            "run_id": run_id or "",
+                            "poll_id": poll_id if poll_id is not None else "",
+                            "ticker": snap.ticker,
+                            "side": str(side),
+                            "reason": "entry_cancel_replace_failed",
+                            "order_id": str(open_id),
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        }
+                    },
+                )
                 return None
+
+    # Structured attempt event right before hitting the Kalshi order endpoint.
+    log.info(
+        "ORDER_ATTEMPT %s side=%s qty=%d @ %dc mode=%s",
+        snap.ticker,
+        str(side),
+        int(qty),
+        int(entry_price_cents),
+        str(entry_mode),
+        extra={
+            "csv_fields": {
+                "run_id": run_id or "",
+                "poll_id": poll_id if poll_id is not None else "",
+                "ticker": snap.ticker,
+                "side": str(side),
+                "action": "buy",
+                "qty": int(qty),
+                "price_cents": int(entry_price_cents),
+                "price_dollars": float(entry_price_dollars),
+                "mode": str(entry_mode),
+                "time_in_force": str(time_in_force_entry),
+                "fee_assumption": "maker" if bool(maker_for_fee_assumption) else "taker",
+                "fee_per_contract": float(fee_per_contract_usd),
+                "spot_usd": snap.btc_spot_usd,
+                "strike_usd": snap.price_to_beat,
+                "strike_src": str(snap.price_to_beat_source or "?"),
+                "tte_s": snap.seconds_to_expiry,
+                "ev_after_fees": float(ev_per_contract),
+            }
+        },
+    )
 
     if side == "YES":
         try:
@@ -1214,7 +1406,27 @@ async def place_order(
             raise
 
     order_id = _extract_order_id(resp)
-    log.info("ORDER_ACK %s side=%s order_id=%s", snap.ticker, side, order_id or "?")
+    log.info(
+        "ORDER_ACK %s side=%s order_id=%s",
+        snap.ticker,
+        side,
+        order_id or "?",
+        extra={
+            "csv_fields": {
+                "run_id": run_id or "",
+                "poll_id": poll_id if poll_id is not None else "",
+                "ticker": snap.ticker,
+                "side": str(side),
+                "action": "buy",
+                "qty": int(qty),
+                "price_cents": int(entry_price_cents),
+                "price_dollars": float(entry_price_dollars),
+                "mode": str(entry_mode),
+                "time_in_force": str(time_in_force_entry),
+                "order_id": str(order_id or "?"),
+            }
+        },
+    )
 
     # If this entry was a re-entry right after a flip-flatten, lock the ticker
     # to hold until expiry so we never flatten this new position.

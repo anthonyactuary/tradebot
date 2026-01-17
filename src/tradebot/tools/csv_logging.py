@@ -25,6 +25,7 @@ class CsvLogHandler(logging.Handler):
       - msg_template
       - message
       - arg0..arg19
+            - <structured field columns>
       - fields_json
       - exception
     """
@@ -34,6 +35,8 @@ class CsvLogHandler(logging.Handler):
     # Common structured fields we want as first-class columns when present.
     # Log sites can attach these via `extra={"csv_fields": {"ticker": "...", ...}}`.
     _FIELD_COLS: tuple[str, ...] = (
+        "run_id",
+        "poll_id",
         "path",
         "ticker",
         "side",
@@ -66,6 +69,22 @@ class CsvLogHandler(logging.Handler):
         "error_type",
     )
 
+    @classmethod
+    def _default_header(cls) -> list[str]:
+        base = [
+            "ts_utc_iso",
+            "ts_epoch",
+            "level",
+            "logger",
+            "event",
+            "msg_template",
+            "message",
+        ]
+        args = [f"arg{i}" for i in range(cls._MAX_ARGS)]
+        fields = list(cls._FIELD_COLS)
+        tail = ["fields_json", "exception"]
+        return base + args + fields + tail
+
     def __init__(self, path: str) -> None:
         super().__init__()
         self._path = str(path)
@@ -92,28 +111,14 @@ class CsvLogHandler(logging.Handler):
             self._header = []
 
         if not self._header:
-            self._header = [
-                "ts_utc_iso",
-                "ts_epoch",
-                "level",
-                "logger",
-                "message",
-                "exception",
-            ]
+            self._header = self._default_header()
 
         # newline='' is important on Windows for correct CSV rows.
         self._fp = open(p, "a", encoding="utf-8", newline="")
         self._writer = csv.writer(self._fp)
 
         if file_empty:
-            self._writer.writerow([
-                "ts_utc_iso",
-                "ts_epoch",
-                "level",
-                "logger",
-                "message",
-                "exception",
-            ])
+            self._writer.writerow(list(self._header))
             self._fp.flush()
 
     @staticmethod
@@ -158,8 +163,43 @@ class CsvLogHandler(logging.Handler):
             created = float(getattr(record, "created", 0.0) or 0.0)
             ts_iso = dt.datetime.fromtimestamp(created, tz=dt.timezone.utc).isoformat()
 
+            msg_template = record.msg
+            if not isinstance(msg_template, str):
+                try:
+                    msg_template = str(msg_template)
+                except Exception:
+                    msg_template = ""
+
+            event = self._event_from_msg_template(str(msg_template))
             msg = record.getMessage()
 
+            args_norm = self._normalize_args(getattr(record, "args", None))
+            if len(args_norm) > self._MAX_ARGS:
+                args_norm = args_norm[: self._MAX_ARGS]
+            args_cols = list(args_norm) + [""] * (self._MAX_ARGS - len(args_norm))
+
+            fields = self._extract_fields_from_record(record)
+            field_cols: list[str] = []
+            remaining: dict[str, object] = dict(fields)
+            for k in self._FIELD_COLS:
+                v = remaining.pop(k, "")
+                if v is None:
+                    field_cols.append("")
+                else:
+                    try:
+                        field_cols.append(str(v))
+                    except Exception:
+                        field_cols.append("<unprintable>")
+
+            fields_json = ""
+            if remaining:
+                try:
+                    fields_json = json.dumps(remaining, sort_keys=True, ensure_ascii=False)
+                except Exception:
+                    try:
+                        fields_json = str(remaining)
+                    except Exception:
+                        fields_json = "<fields_json_error>"
 
             exc_text: str = ""
             if record.exc_info:
@@ -168,18 +208,43 @@ class CsvLogHandler(logging.Handler):
                 except Exception:
                     exc_text = "<exception_format_error>"
 
-
             row = [
                 ts_iso,
                 f"{created:.6f}",
                 str(record.levelname),
                 str(record.name),
+                str(event),
+                str(msg_template),
                 str(msg),
-                str(exc_text),
             ]
+            row.extend(args_cols)
+            row.extend(field_cols)
+            row.append(str(fields_json))
+            row.append(str(exc_text))
 
             with self._lock:
-                self._writer.writerow(row)
+                # Preserve the existing file header shape by writing rows in that order.
+                if self._header == self._default_header():
+                    self._writer.writerow(row)
+                else:
+                    row_map: dict[str, str] = {
+                        "ts_utc_iso": ts_iso,
+                        "ts_epoch": f"{created:.6f}",
+                        "level": str(record.levelname),
+                        "logger": str(record.name),
+                        "event": str(event),
+                        "msg_template": str(msg_template),
+                        "message": str(msg),
+                        "fields_json": str(fields_json),
+                        "exception": str(exc_text),
+                    }
+                    for i in range(self._MAX_ARGS):
+                        row_map[f"arg{i}"] = str(args_cols[i])
+                    for idx, k in enumerate(self._FIELD_COLS):
+                        row_map[k] = str(field_cols[idx])
+
+                    out_row = [row_map.get(str(col), "") for col in self._header]
+                    self._writer.writerow(out_row)
                 self._fp.flush()
         except Exception:
             # Never let logging failures crash the bot.
