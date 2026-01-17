@@ -1,17 +1,12 @@
-"""Statistical models for market making."""
+# tradebot.models - ML model training, testing, and calibration
 
-from tradebot.models.order_flow import OrderFlowImbalance
-from tradebot.models.garch_vol import GARCHVolatility
-from tradebot.models.kelly import KellyCriterion
-from tradebot.models.regime import RegimeDetector
-from tradebot.models.avellaneda_stoikov import AvellanedaStoikov
-from tradebot.models.fill_probability import FillProbabilityModel
+from tradebot.models.prob_calibration_platt import PlattCalibrator
+from tradebot.models.prob_calibration_isotonic import IsotonicCalibrator
+from tradebot.models.prob_calibration_bucketed import BucketedCalibrator, bucket_fn
 
 __all__ = [
-    "OrderFlowImbalance",
-    "GARCHVolatility", 
-    "KellyCriterion",
-    "RegimeDetector",
-    "AvellanedaStoikov",
-    "FillProbabilityModel",
+    "PlattCalibrator",
+    "IsotonicCalibrator",
+    "BucketedCalibrator",
+    "bucket_fn",
 ]
