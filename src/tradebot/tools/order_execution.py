@@ -640,6 +640,14 @@ async def place_order(
     monotonicity_tte_threshold: int = 360,
     monotonicity_market_confidence: float = 0.80,
     monotonicity_model_diff: float = 0.05,
+    monotonicity_extreme_confidence: float = 0.85,
+    monotonicity_diff_at_extreme: float = 0.25,
+    monotonicity_diff_at_high: float = 0.20,
+    monotonicity_late_tte_threshold: int = 480,
+    monotonicity_late_tte_buffer: float = 0.05,
+    trend_veto_enabled: bool = True,
+    trend_veto_market_confidence: float = 0.75,
+    trend_veto_model_disagreement: float = 0.20,
     allow_reentry_after_flatten: bool = False,
     flatten_tier_enabled: bool = True,
     flatten_tier_seconds: int = 30,
@@ -1258,15 +1266,28 @@ async def place_order(
         else:
             model_diff = 1.0  # No confidence threshold met, won't block
 
+        # Piecewise threshold: require larger diff at extreme market confidence
+        # This blocks "market 75-85%, model 60-72%" fades more aggressively
+        confident_p = float(market_p_yes) if market_confident_yes else float(market_p_no)
+        if confident_p >= float(monotonicity_extreme_confidence):
+            required_diff = float(monotonicity_diff_at_extreme)
+        elif confident_p >= float(monotonicity_market_confidence):
+            required_diff = float(monotonicity_diff_at_high)
+        else:
+            required_diff = float(monotonicity_model_diff)
+        
+        # Add extra buffer when TTE < late threshold (more noise near expiry)
+        if int(tte_mono) < int(monotonicity_late_tte_threshold):
+            required_diff += float(monotonicity_late_tte_buffer)
+
         should_block_monotonicity = (
             int(tte_mono) < int(monotonicity_tte_threshold)
             and (market_confident_yes or market_confident_no)
-            and float(model_diff) < float(monotonicity_model_diff)
+            and float(model_diff) < required_diff
         )
 
         if should_block_monotonicity:
             confident_side = "YES" if market_confident_yes else "NO"
-            confident_p = float(market_p_yes) if market_confident_yes else float(market_p_no)
             log.info(
                 "MONOTONICITY_BLOCK %s side=%s tte=%ds market_p_%s=%.2f p_model=%.2f diff=%.4f < threshold=%.4f",
                 snap.ticker,
@@ -1276,7 +1297,7 @@ async def place_order(
                 confident_p,
                 float(p_model),
                 float(model_diff),
-                float(monotonicity_model_diff),
+                required_diff,
             )
             log.info(
                 "ORDER_BLOCK %s side=%s reason_block=monotonicity_guard",
@@ -1294,6 +1315,113 @@ async def place_order(
                         "market_p_no": float(market_p_no),
                         "p_model": float(p_model),
                         "model_diff": float(model_diff),
+                        "required_diff": required_diff,
+                    }
+                },
+            )
+            return None
+
+    # Trend alignment veto: block entries that fade strong market consensus
+    # when spot/strike relationship and recent trend align with that consensus.
+    # This prevents fading strong directional moves unless model strongly disagrees.
+    if bool(trend_veto_enabled) and (not did_flatten or allow_entry_post_flatten):
+        market_p_yes_tv = edge.market_p_yes if edge.market_p_yes is not None else 0.5
+        market_p_no_tv = edge.market_p_no if edge.market_p_no is not None else 0.5
+        p_model_tv = edge.p_yes if edge.p_yes is not None else 0.5
+        spot_tv = snap.btc_spot_usd
+        strike_tv = snap.price_to_beat
+        cb_mid_tv = snap.coinbase_mid_usd
+        vwap_tv = snap.coinbase_vwap_60s
+
+        should_veto = False
+        veto_direction: str | None = None
+        model_disagreement: float = 0.0
+        confident_p: float = 0.0
+
+        # Case 1: Block NO entries when market confident YES + uptrend + spot > strike
+        if side == "NO":
+            market_confident_yes = float(market_p_yes_tv) >= float(trend_veto_market_confidence)
+            spot_above_strike = (
+                spot_tv is not None and strike_tv is not None
+                and float(spot_tv) > float(strike_tv)
+            )
+            trend_positive = (
+                cb_mid_tv is not None and vwap_tv is not None
+                and float(cb_mid_tv) > float(vwap_tv)
+            )
+            # Model disagreement: model thinks NO is more likely than market implies
+            model_disagreement = float(market_p_yes_tv) - float(p_model_tv)
+            strong_disagreement = float(model_disagreement) >= float(trend_veto_model_disagreement)
+            confident_p = float(market_p_yes_tv)
+
+            should_veto = (
+                market_confident_yes
+                and spot_above_strike
+                and trend_positive
+                and not strong_disagreement
+            )
+            if should_veto:
+                veto_direction = "NO_in_uptrend"
+
+        # Case 2: Block YES entries when market confident NO + downtrend + spot < strike
+        elif side == "YES":
+            market_confident_no = float(market_p_no_tv) >= float(trend_veto_market_confidence)
+            spot_below_strike = (
+                spot_tv is not None and strike_tv is not None
+                and float(spot_tv) < float(strike_tv)
+            )
+            trend_negative = (
+                cb_mid_tv is not None and vwap_tv is not None
+                and float(cb_mid_tv) < float(vwap_tv)
+            )
+            # Model disagreement: model thinks YES is more likely than market implies
+            model_disagreement = float(p_model_tv) - float(market_p_yes_tv)
+            strong_disagreement = float(model_disagreement) >= float(trend_veto_model_disagreement)
+            confident_p = float(market_p_no_tv)
+
+            should_veto = (
+                market_confident_no
+                and spot_below_strike
+                and trend_negative
+                and not strong_disagreement
+            )
+            if should_veto:
+                veto_direction = "YES_in_downtrend"
+
+        if should_veto:
+            log.info(
+                "TREND_VETO_BLOCK %s side=%s reason=%s market_p_yes=%.2f market_p_no=%.2f p_model=%.2f spot=%s strike=%s cb_mid=%s vwap=%s disagreement=%.3f",
+                snap.ticker,
+                side,
+                veto_direction,
+                float(market_p_yes_tv),
+                float(market_p_no_tv),
+                float(p_model_tv),
+                _fmt_usd(spot_tv),
+                _fmt_usd(strike_tv),
+                _fmt_usd(cb_mid_tv),
+                _fmt_usd(vwap_tv),
+                float(model_disagreement),
+            )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=trend_veto",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": f"trend_veto:{veto_direction}",
+                        "market_p_yes": float(market_p_yes_tv),
+                        "market_p_no": float(market_p_no_tv),
+                        "p_model": float(p_model_tv),
+                        "spot_usd": spot_tv,
+                        "strike_usd": strike_tv,
+                        "cb_mid": cb_mid_tv,
+                        "vwap_60s": vwap_tv,
+                        "model_disagreement": float(model_disagreement),
                     }
                 },
             )
