@@ -102,6 +102,22 @@ class _PendingFlipReentry:
 _PENDING_FLIP_REENTRY_BY_TICKER: dict[str, _PendingFlipReentry] = {}
 
 
+# Track partial (tiered) flatten state per ticker.
+# When a flip is first detected, we flatten half. After flatten_tier_seconds,
+# if flip signal persists, we flatten the remainder.
+@dataclass(frozen=True)
+class _PartialFlatten:
+    ts: float  # when first tier was executed
+    from_side: Side  # side we're flattening from
+    to_side: Side  # side we want to flip to
+    original_qty: int  # original position size
+    flattened_qty: int  # how many contracts flattened so far
+    remaining_qty: int  # contracts still to flatten
+
+
+_PARTIAL_FLATTEN_BY_TICKER: dict[str, _PartialFlatten] = {}
+
+
 # If Kalshi reports trading is paused, back off briefly to avoid spamming orders.
 _TRADING_PAUSED_UNTIL_TS: float | None = None
 _TRADING_PAUSED_BACKOFF_SECONDS = 60.0
@@ -437,7 +453,7 @@ def _spot_strike_diff_fraction(*, snap: MarketSnapshot) -> float | None:
     return abs(spot_f - strike_f) / spot_f
 
 
-async def _sell_to_flat(
+async def _buy_opposite_to_flat(
     *,
     client: KalshiClient,
     snap: MarketSnapshot,
@@ -446,24 +462,49 @@ async def _sell_to_flat(
     time_in_force: Literal["fill_or_kill", "good_till_canceled", "immediate_or_cancel"] | None,
     dry_run: bool,
 ) -> dict[str, Any] | None:
-    bid_cents = _best_bid_cents_from_snapshot(snap, side=held_side)
-    if bid_cents is None:
+    """Flatten position by buying the opposite side.
+
+    Instead of selling YES at YES_bid, we buy NO at NO_ask.
+    This is economically equivalent but incurs lower fees because:
+    - Selling YES @ 80c -> fee calculated on 80c
+    - Buying NO @ 20c -> fee calculated on 20c (much lower!)
+
+    The position automatically offsets on Kalshi.
+    """
+    # Determine the opposite side to buy
+    opposite_side: Side = "NO" if held_side == "YES" else "YES"
+
+    # Get best ask for the opposite side
+    ask_cents, ask_dollars = _side_prices_from_snapshot(snap, side=opposite_side)
+    if ask_cents is None or ask_dollars is None:
         log.warning(
-            "FLATTEN_BLOCK %s held=%s qty=%d reason=missing_best_bid best_yes_bid=%s best_no_bid=%s",
+            "FLATTEN_BLOCK %s held=%s qty=%d reason=missing_opposite_ask opposite=%s best_yes_ask=%s best_no_ask=%s",
             snap.ticker,
             held_side,
             int(close_qty),
-            str(snap.best_yes_bid),
-            str(snap.best_no_bid),
+            opposite_side,
+            str(snap.best_yes_ask),
+            str(snap.best_no_ask),
         )
         return None
 
+    # Calculate fee savings for logging
+    old_bid_cents = _best_bid_cents_from_snapshot(snap, side=held_side)
+    fee_saved_pct = 0.0
+    if old_bid_cents is not None and int(old_bid_cents) > 0:
+        # Old method: sell at bid_cents, new method: buy at ask_cents
+        fee_saved_pct = (1.0 - float(ask_cents) / float(old_bid_cents)) * 100.0
+
     log.info(
-        "FLATTEN %s sell_%s qty=%d @ %dc spot=%s strike=%s tte=%ss",
+        "FLATTEN %s buy_%s_to_close_%s qty=%d @ %dc (vs sell_%s @ %dc) fee_saved~%.1f%% spot=%s strike=%s tte=%ss",
         snap.ticker,
+        opposite_side,
         held_side,
         int(close_qty),
-        int(bid_cents),
+        int(ask_cents),
+        held_side,
+        int(old_bid_cents or 0),
+        float(fee_saved_pct),
         _fmt_usd(snap.btc_spot_usd),
         _fmt_usd(snap.price_to_beat),
         "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
@@ -473,25 +514,24 @@ async def _sell_to_flat(
         return {
             "dry_run": True,
             "ticker": snap.ticker,
-            "action": "sell",
-            "side": held_side,
+            "action": "buy",
+            "side": opposite_side,
             "count": int(close_qty),
-            "price": int(bid_cents),
-            "reduce_only": True,
+            "price": int(ask_cents),
+            "flatten_method": "buy_opposite",
         }
 
     client_order_id = str(uuid.uuid4())
-    if held_side == "YES":
+    if opposite_side == "YES":
         try:
             return await client.create_order(
                 ticker=snap.ticker,
                 side="yes",
-                action="sell",
+                action="buy",
                 count=int(close_qty),
                 order_type="limit",
-                yes_price=int(bid_cents),
+                yes_price=int(ask_cents),
                 client_order_id=client_order_id,
-                reduce_only=True,
                 time_in_force=time_in_force,
             )
         except Exception as e:
@@ -503,12 +543,11 @@ async def _sell_to_flat(
         return await client.create_order(
             ticker=snap.ticker,
             side="no",
-            action="sell",
+            action="buy",
             count=int(close_qty),
             order_type="limit",
-            no_price=int(bid_cents),
+            no_price=int(ask_cents),
             client_order_id=client_order_id,
-            reduce_only=True,
             time_in_force=time_in_force,
         )
     except Exception as e:
@@ -516,6 +555,16 @@ async def _sell_to_flat(
             _set_trading_paused_backoff(ticker=snap.ticker, reason="flatten_trading_is_paused")
             return None
         raise
+
+
+def _get_partial_flatten(*, snap: MarketSnapshot) -> _PartialFlatten | None:
+    """Get any active partial flatten state for this ticker."""
+    return _PARTIAL_FLATTEN_BY_TICKER.get(snap.ticker)
+
+
+def _clear_partial_flatten(*, snap: MarketSnapshot) -> None:
+    """Clear partial flatten state for this ticker."""
+    _PARTIAL_FLATTEN_BY_TICKER.pop(snap.ticker, None)
 
 
 def _risk_delta_contracts(*, side: Literal["YES", "NO"], qty: int) -> int:
@@ -587,7 +636,13 @@ async def place_order(
     dead_zone: float = 0.05,
     exit_delta: float = 0.09,
     catastrophic_exit_delta: float = 0.20,
+    monotonicity_guard_enabled: bool = True,
+    monotonicity_tte_threshold: int = 360,
+    monotonicity_market_confidence: float = 0.80,
+    monotonicity_model_diff: float = 0.05,
     allow_reentry_after_flatten: bool = False,
+    flatten_tier_enabled: bool = True,
+    flatten_tier_seconds: int = 30,
     confirm_entry_fill: bool = True,
     risk_limits: RiskLimits | None = None,
     risk_tickers: list[str] | None = None,
@@ -811,9 +866,13 @@ async def place_order(
             return None
 
     # Flip handling (do not open opposite-side while still holding current).
-    # If holding YES and we want NO: sell YES first; then buy NO if flattened.
-    # If holding NO and we want YES: sell NO first; then buy YES if flattened.
+    # If holding YES and we want NO: buy NO to flatten (cheaper fees than selling YES).
+    # If holding NO and we want YES: buy YES to flatten (cheaper fees than selling NO).
+    #
+    # Tiered flatten: First flatten HALF, wait flatten_tier_seconds, then flatten remainder
+    # if flip signal persists. This protects against whipsaw noise.
     did_flatten = False
+    did_partial_flatten = False
     flip_reentry = False
     flip_from_side: Side | None = None
     hold_to_expiry_after_entry = False
@@ -829,6 +888,10 @@ async def place_order(
         ti = inv_for_flip.per_ticker.get(snap.ticker)
         cur_pos = int(ti.position) if ti is not None else 0
         held = _held_side_from_position(cur_pos)
+
+        # Check for existing partial flatten state
+        partial = _get_partial_flatten(snap=snap)
+
         if held is not None and held != side:
             flip_from_side = held
             if _hold_to_expiry_active(snap=snap):
@@ -852,6 +915,16 @@ async def place_order(
             # meaningfully past 0.5 by exit_delta (or catastrophic threshold).
             p_held = _p_for_side(edge, side=held)
             if p_held >= 0.5 - float(exit_delta):
+                # Signal not strong enough - clear any partial flatten state
+                if partial is not None:
+                    log.info(
+                        "PARTIAL_FLATTEN_CANCEL %s held=%s want=%s reason=exit_delta_not_met p_held=%.3f",
+                        snap.ticker,
+                        held,
+                        side,
+                        float(p_held),
+                    )
+                    _clear_partial_flatten(snap=snap)
                 log.info(
                     "FLIP_BLOCK %s held=%s want=%s p_held=%.3f >= %.3f (0.5-exit_delta)",
                     snap.ticker,
@@ -883,16 +956,93 @@ async def place_order(
             if float(ev_new_side_after_fees) > 0:
                 close_qty = abs(cur_pos)
                 if close_qty > 0:
-                    resp = await _sell_to_flat(
+                    # Determine how much to flatten this tier
+                    flatten_qty: int = 0
+                    is_tier_two: bool = False
+
+                    if bool(flatten_tier_enabled) and partial is None:
+                        # TIER 1: First time seeing flip signal - flatten HALF
+                        flatten_qty = max(1, close_qty // 2)
+                        log.info(
+                            "FLATTEN_TIER1 %s held=%s want=%s full_qty=%d flatten_qty=%d (half)",
+                            snap.ticker,
+                            held,
+                            side,
+                            int(close_qty),
+                            int(flatten_qty),
+                        )
+                    elif bool(flatten_tier_enabled) and partial is not None:
+                        # Check if enough time has passed for tier 2
+                        elapsed = float(now_ts - float(partial.ts))
+                        if elapsed < float(flatten_tier_seconds):
+                            log.info(
+                                "FLATTEN_TIER2_WAIT %s held=%s want=%s elapsed=%.1fs < tier_seconds=%ds remaining=%d",
+                                snap.ticker,
+                                held,
+                                side,
+                                float(elapsed),
+                                int(flatten_tier_seconds),
+                                int(partial.remaining_qty),
+                            )
+                            return None
+                        # TIER 2: Time elapsed and signal persists - flatten remainder
+                        flatten_qty = int(partial.remaining_qty)
+                        is_tier_two = True
+                        log.info(
+                            "FLATTEN_TIER2 %s held=%s want=%s elapsed=%.1fs remaining_qty=%d (completing flatten)",
+                            snap.ticker,
+                            held,
+                            side,
+                            float(elapsed),
+                            int(flatten_qty),
+                        )
+                    else:
+                        # Tiered flatten disabled - flatten full position
+                        flatten_qty = close_qty
+
+                    if flatten_qty <= 0:
+                        log.warning("FLATTEN_SKIP %s flatten_qty=%d", snap.ticker, int(flatten_qty))
+                        return None
+
+                    # Execute flatten by buying opposite side (lower fees!)
+                    resp = await _buy_opposite_to_flat(
                         client=client,
                         snap=snap,
                         held_side=held,
-                        close_qty=int(close_qty),
+                        close_qty=int(flatten_qty),
                         time_in_force=time_in_force,
                         dry_run=bool(dry_run),
                     )
                     if resp is None:
                         return None
+
+                    # Update partial flatten state
+                    remaining_after = close_qty - flatten_qty
+                    if remaining_after > 0 and bool(flatten_tier_enabled) and not is_tier_two:
+                        # Store partial flatten state for tier 2
+                        _PARTIAL_FLATTEN_BY_TICKER[snap.ticker] = _PartialFlatten(
+                            ts=float(now_ts),
+                            from_side=held,
+                            to_side=side,
+                            original_qty=int(close_qty),
+                            flattened_qty=int(flatten_qty),
+                            remaining_qty=int(remaining_after),
+                        )
+                        did_partial_flatten = True
+                        log.info(
+                            "PARTIAL_FLATTEN_ARMED %s from=%s to=%s flattened=%d remaining=%d wait_seconds=%d",
+                            snap.ticker,
+                            held,
+                            side,
+                            int(flatten_qty),
+                            int(remaining_after),
+                            int(flatten_tier_seconds),
+                        )
+                        # Don't proceed to re-entry yet - wait for tier 2
+                        return None
+                    else:
+                        # Full flatten complete (either tier 2 or tiering disabled)
+                        _clear_partial_flatten(snap=snap)
 
                     if bool(allow_reentry_after_flatten):
                         _arm_pending_flip_reentry(snap=snap, from_side=held, to_side=side)
@@ -950,6 +1100,17 @@ async def place_order(
                         _NO_REENTRY_UNTIL_BY_TICKER.pop(snap.ticker, None)
                         hold_to_expiry_after_entry = True
                         flip_reentry = True
+
+        elif held is None or held == side:
+            # No flip needed, but clear any stale partial flatten state if signal changed
+            if partial is not None and (held is None or str(partial.to_side) != str(side)):
+                log.info(
+                    "PARTIAL_FLATTEN_CLEAR %s reason=no_longer_flipping partial_to=%s current_side=%s",
+                    snap.ticker,
+                    str(partial.to_side),
+                    str(side) if held else "flat",
+                )
+                _clear_partial_flatten(snap=snap)
 
     allow_entry_post_flatten = bool(did_flatten and allow_reentry_after_flatten and hold_to_expiry_after_entry)
 
@@ -1075,6 +1236,68 @@ async def place_order(
             },
         )
         return None
+
+    # Monotonicity guard: Block trades in late markets when market is already very confident
+    # and model agrees with market. This prevents microstructure noise from triggering trades
+    # when both model and market already indicate a near-certain outcome.
+    if bool(monotonicity_guard_enabled) and (not did_flatten or allow_entry_post_flatten):
+        tte_mono = snap.seconds_to_expiry if snap.seconds_to_expiry is not None else 9999
+        market_p_yes = edge.market_p_yes if edge.market_p_yes is not None else 0.5
+        market_p_no = edge.market_p_no if edge.market_p_no is not None else 0.5
+        p_model = edge.p_yes if edge.p_yes is not None else 0.5
+
+        # Check if market is confident in either direction
+        market_confident_yes = float(market_p_yes) >= float(monotonicity_market_confidence)
+        market_confident_no = float(market_p_no) >= float(monotonicity_market_confidence)
+
+        # Model agreement: model is close to market price
+        if market_confident_yes:
+            model_diff = abs(float(p_model) - float(market_p_yes))
+        elif market_confident_no:
+            model_diff = abs((1.0 - float(p_model)) - float(market_p_no))
+        else:
+            model_diff = 1.0  # No confidence threshold met, won't block
+
+        should_block_monotonicity = (
+            int(tte_mono) < int(monotonicity_tte_threshold)
+            and (market_confident_yes or market_confident_no)
+            and float(model_diff) < float(monotonicity_model_diff)
+        )
+
+        if should_block_monotonicity:
+            confident_side = "YES" if market_confident_yes else "NO"
+            confident_p = float(market_p_yes) if market_confident_yes else float(market_p_no)
+            log.info(
+                "MONOTONICITY_BLOCK %s side=%s tte=%ds market_p_%s=%.2f p_model=%.2f diff=%.4f < threshold=%.4f",
+                snap.ticker,
+                side,
+                int(tte_mono),
+                confident_side.lower(),
+                confident_p,
+                float(p_model),
+                float(model_diff),
+                float(monotonicity_model_diff),
+            )
+            log.info(
+                "ORDER_BLOCK %s side=%s reason_block=monotonicity_guard",
+                snap.ticker,
+                str(side),
+                extra={
+                    "csv_fields": {
+                        "run_id": run_id or "",
+                        "poll_id": poll_id if poll_id is not None else "",
+                        "ticker": snap.ticker,
+                        "side": str(side),
+                        "reason": "monotonicity_guard",
+                        "tte_s": int(tte_mono),
+                        "market_p_yes": float(market_p_yes),
+                        "market_p_no": float(market_p_no),
+                        "p_model": float(p_model),
+                        "model_diff": float(model_diff),
+                    }
+                },
+            )
+            return None
 
     # Time gate: optionally block trades that are "too early" in the market window.
     # Applies to opening/adding, not to flattening.

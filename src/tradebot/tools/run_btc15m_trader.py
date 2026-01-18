@@ -71,8 +71,13 @@ class TraderConfig:
     duration_seconds: float = 0.0  # 0 = run forever
     asset: str = "BTC"
     horizon_minutes: int = 60
-    limit_markets: int = 2
+    limit_markets: int = 1
     min_seconds_to_expiry: int = 30
+
+    # Spot price source
+    # When True, uses composite mid (Coinbase + Kraken average) for better BRTI approximation
+    # When False, uses Coinbase mid only
+    use_kraken_composite: bool = False
 
     # Signal
     fee_mode: FeeMode = "taker"
@@ -113,6 +118,13 @@ class TraderConfig:
     exit_delta: float = 0.10
     catastrophic_exit_delta: float = 0.18
 
+    # Monotonicity guard: blocks trades in late markets when market is very confident
+    # and model agrees with market (avoids microstructure noise near expiry)
+    monotonicity_guard_enabled: bool = True
+    monotonicity_tte_threshold: int = 480  # 8 minutes in seconds
+    monotonicity_market_confidence: float = 0.80  # market_p_yes >= this to trigger
+    monotonicity_model_diff: float = 0.05  # abs(p_model - market_p_yes) < this to block
+
     # Data sanity
     # Block entry orders if Kalshi strike is too far from external spot (helps when
     # strike is briefly wrong early in a market).
@@ -124,6 +136,11 @@ class TraderConfig:
     # If enabled, a flip-flatten (decision change) may immediately re-enter the opposite side,
     # and that re-entry position will be held until expiry (no further flawttening).
     allow_reentry_after_flatten: bool = True
+
+    # Tiered flatten: when flipping, first flatten HALF, wait, then flatten remainder
+    # if flip signal persists. Protects against whipsaw noise.
+    flatten_tier_enabled: bool = True
+    flatten_tier_seconds: int = 20  # seconds to wait between tier 1 and tier 2
 
     # Risk limits (set to None to disable a specific limit)
     max_total_abs_contracts: int | None = 7.0
@@ -213,6 +230,7 @@ async def _run_once(
             bankroll_usd=bankroll_usd,
             kelly_multiplier=float(cfg.kelly_mult),
             kelly_max_fraction=float(cfg.kelly_max_fraction),
+            use_kraken_composite=bool(cfg.use_kraken_composite),
         )
         signals.append((s, sig))
         # Use logging so it also gets captured by CSV logs.
@@ -305,7 +323,13 @@ async def _run_once(
                 dead_zone=float(cfg.dead_zone),
                 exit_delta=float(cfg.exit_delta),
                 catastrophic_exit_delta=float(cfg.catastrophic_exit_delta),
+                monotonicity_guard_enabled=bool(cfg.monotonicity_guard_enabled),
+                monotonicity_tte_threshold=int(cfg.monotonicity_tte_threshold),
+                monotonicity_market_confidence=float(cfg.monotonicity_market_confidence),
+                monotonicity_model_diff=float(cfg.monotonicity_model_diff),
                 allow_reentry_after_flatten=bool(cfg.allow_reentry_after_flatten),
+                flatten_tier_enabled=bool(cfg.flatten_tier_enabled),
+                flatten_tier_seconds=int(cfg.flatten_tier_seconds),
                 fee_mode=str(cfg.fee_mode),
                 dry_run=bool(cfg.dry_run),
                 spot_strike_sanity_enabled=bool(cfg.spot_strike_sanity_enabled),

@@ -74,29 +74,38 @@ class InferenceResult:
     error: str | None = None
 
 
-def choose_proxy_spot_usd(snap: MarketSnapshot) -> tuple[float | None, str]:
+def choose_proxy_spot_usd(
+    snap: MarketSnapshot,
+    *,
+    use_kraken_composite: bool = True,
+) -> tuple[float | None, str]:
     """Pick the spot proxy used for delta.
 
-    Priority:
-    1. Near expiry (≤60s): Coinbase VWAP (if fresh and has enough trades)
-    2. Composite mid (Coinbase + Kraken average) - best BRTI approximation
-    3. Coinbase mid alone
-    4. Coinbase ticker (fallback)
+    TTE-based switching:
+    - TTE > 120s: Use Coinbase VWAP (smoother, less noisy for position decisions)
+    - TTE ≤ 120s: Use mid (coinbase or composite) for tighter settlement alignment
+
+    Rationale: VWAP is more stable for entries/position management, but near
+    settlement we want the mid price that better tracks where BRTI will settle.
     """
 
-    # Near expiry: use VWAP for best settlement alignment
-    if (
-        snap.seconds_to_expiry is not None
-        and int(snap.seconds_to_expiry) <= 60
-        and snap.coinbase_vwap_60s is not None
-        and snap.coinbase_vwap_age_ms is not None
-        and int(snap.coinbase_vwap_age_ms) <= 2000
-        and int(snap.coinbase_vwap_count) >= 10
-    ):
-        return (float(snap.coinbase_vwap_60s), "vwap_60s")
+    tte = snap.seconds_to_expiry
+    tte_int = int(tte) if tte is not None else 9999
 
-    # Prefer composite mid (Coinbase + Kraken) for better BRTI approximation
-    if hasattr(snap, "composite_mid_usd") and snap.composite_mid_usd is not None:
+    # TTE > 120s: prefer VWAP for smoother price signal
+    if tte_int > 120:
+        if (
+            snap.coinbase_vwap_60s is not None
+            and snap.coinbase_vwap_age_ms is not None
+            and int(snap.coinbase_vwap_age_ms) <= 2000
+            and int(snap.coinbase_vwap_count) >= 10
+        ):
+            return (float(snap.coinbase_vwap_60s), "vwap_60s")
+        # VWAP not available/fresh - fall through to mid
+
+    # TTE ≤ 120s OR VWAP unavailable: use mid for settlement alignment
+    # Prefer composite mid (Coinbase + Kraken) if enabled
+    if bool(use_kraken_composite) and hasattr(snap, "composite_mid_usd") and snap.composite_mid_usd is not None:
         return (float(snap.composite_mid_usd), "composite_mid")
 
     # Fall back to Coinbase mid alone

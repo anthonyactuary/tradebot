@@ -246,6 +246,7 @@ async def signal_for_snapshot(
     bankroll_usd: float | None,
     kelly_multiplier: float,
     kelly_max_fraction: float,
+    use_kraken_composite: bool = True,
 ) -> TradeSignal:
     try:
         if snap.price_to_beat is None:
@@ -255,7 +256,7 @@ async def signal_for_snapshot(
         if snap.market_p_yes is None or snap.market_p_no is None:
             raise ValueError("missing market_p_yes/market_p_no")
 
-        proxy_spot_usd, spot_source = choose_proxy_spot_usd(snap)
+        proxy_spot_usd, spot_source = choose_proxy_spot_usd(snap, use_kraken_composite=bool(use_kraken_composite))
         if proxy_spot_usd is None:
             return TradeSignal(
                 poll_utc_iso=snap.poll_utc_iso,

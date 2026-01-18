@@ -264,8 +264,9 @@ def _market_price_to_beat(market: dict[str, Any]) -> tuple[float | None, str]:
             return (parsed, field)
 
     def _extract_best_candidate(text: str) -> float | None:
+        # Match prices like $94,902.05 or 94902 - require at least 5 digits to avoid year extraction (2026)
         matches = re.findall(
-            r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})(?:\.[0-9]+)?",
+            r"\$\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})(?:\.[0-9]+)?",
             text,
         )
         if not matches:
@@ -276,7 +277,8 @@ def _market_price_to_beat(market: dict[str, Any]) -> tuple[float | None, str]:
                 candidates.append(float(m.replace(",", "")))
             except Exception:
                 continue
-        candidates = [c for c in candidates if 1_000 <= c <= 10_000_000]
+        # BTC prices are typically 10,000 - 1,000,000
+        candidates = [c for c in candidates if 10_000 <= c <= 1_000_000]
         if not candidates:
             return None
         return max(candidates)
@@ -405,20 +407,32 @@ async def pick_active_markets(
     horizon = dt.timedelta(minutes=int(horizon_minutes))
 
     series_ticker = f"KX{asset.upper()}15M"
+    
+    # Kalshi uses US Eastern Time for ticker dates, not UTC
+    try:
+        import zoneinfo
+        et_tz = zoneinfo.ZoneInfo("America/New_York")
+    except Exception:
+        # Fallback: approximate ET as UTC-5
+        et_tz = dt.timezone(dt.timedelta(hours=-5))
+    
+    now_et = now.astimezone(et_tz)
+    today_prefix = f"{series_ticker}-{now_et.strftime('%y%b%d').upper()}"
 
-    # Query without status filter - API status filter doesn't include "active"
-    # which is what KXBTC15M markets use when tradeable
+    # Query all markets for this series - we'll filter by time client-side
     page = await client.get_markets_page(
-        limit=100,
+        limit=200,  # Get more to find current ones
         series_ticker=series_ticker,
         mve_filter="exclude",
     )
 
     all_markets = list(page.get("markets", []) or [])
-
-    # Filter for tradeable statuses (open or active)
-    tradeable_statuses = {"open", "active"}
-    markets = [m for m in all_markets if m.get("status") in tradeable_statuses]
+    
+    # Filter to only today's markets first (alphabetical sort from API puts wrong dates first)
+    todays_markets = [m for m in all_markets if str(m.get("ticker", "")).upper().startswith(today_prefix)]
+    
+    # Accept any status - we'll filter by time
+    markets = todays_markets if todays_markets else all_markets
 
     valid: list[tuple[dt.datetime, dict[str, Any]]] = []
     for m in markets:
@@ -429,7 +443,8 @@ async def pick_active_markets(
             continue
         if cutoff - now > horizon:
             continue
-        if int((cutoff - now).total_seconds()) < int(min_seconds_to_expiry):
+        tte_seconds = int((cutoff - now).total_seconds())
+        if tte_seconds < int(min_seconds_to_expiry):
             continue
         valid.append((cutoff, m))
 
