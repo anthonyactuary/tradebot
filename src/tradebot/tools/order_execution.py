@@ -453,7 +453,7 @@ def _spot_strike_diff_fraction(*, snap: MarketSnapshot) -> float | None:
     return abs(spot_f - strike_f) / spot_f
 
 
-async def _buy_opposite_to_flat(
+async def _sell_to_flat(
     *,
     client: KalshiClient,
     snap: MarketSnapshot,
@@ -462,49 +462,31 @@ async def _buy_opposite_to_flat(
     time_in_force: Literal["fill_or_kill", "good_till_canceled", "immediate_or_cancel"] | None,
     dry_run: bool,
 ) -> dict[str, Any] | None:
-    """Flatten position by buying the opposite side.
+    """Flatten position by selling the held side.
 
-    Instead of selling YES at YES_bid, we buy NO at NO_ask.
-    This is economically equivalent but incurs lower fees because:
-    - Selling YES @ 80c -> fee calculated on 80c
-    - Buying NO @ 20c -> fee calculated on 20c (much lower!)
-
-    The position automatically offsets on Kalshi.
+    Sells YES at YES_bid or NO at NO_bid to close the position.
     """
-    # Determine the opposite side to buy
-    opposite_side: Side = "NO" if held_side == "YES" else "YES"
-
-    # Get best ask for the opposite side
-    ask_cents, ask_dollars = _side_prices_from_snapshot(snap, side=opposite_side)
-    if ask_cents is None or ask_dollars is None:
+    # Get best bid for the held side (we're selling)
+    bid_cents = _best_bid_cents_from_snapshot(snap, side=held_side)
+    if bid_cents is None:
         log.warning(
-            "FLATTEN_BLOCK %s held=%s qty=%d reason=missing_opposite_ask opposite=%s best_yes_ask=%s best_no_ask=%s",
+            "FLATTEN_BLOCK %s held=%s qty=%d reason=missing_bid best_yes_bid=%s best_no_bid=%s",
             snap.ticker,
             held_side,
             int(close_qty),
-            opposite_side,
-            str(snap.best_yes_ask),
-            str(snap.best_no_ask),
+            str(snap.best_yes_bid),
+            str(snap.best_no_bid),
         )
         return None
 
-    # Calculate fee savings for logging
-    old_bid_cents = _best_bid_cents_from_snapshot(snap, side=held_side)
-    fee_saved_pct = 0.0
-    if old_bid_cents is not None and int(old_bid_cents) > 0:
-        # Old method: sell at bid_cents, new method: buy at ask_cents
-        fee_saved_pct = (1.0 - float(ask_cents) / float(old_bid_cents)) * 100.0
+    bid_dollars = float(bid_cents) / 100.0
 
     log.info(
-        "FLATTEN %s buy_%s_to_close_%s qty=%d @ %dc (vs sell_%s @ %dc) fee_saved~%.1f%% spot=%s strike=%s tte=%ss",
+        "FLATTEN %s sell_%s qty=%d @ %dc spot=%s strike=%s tte=%ss",
         snap.ticker,
-        opposite_side,
         held_side,
         int(close_qty),
-        int(ask_cents),
-        held_side,
-        int(old_bid_cents or 0),
-        float(fee_saved_pct),
+        int(bid_cents),
         _fmt_usd(snap.btc_spot_usd),
         _fmt_usd(snap.price_to_beat),
         "?" if snap.seconds_to_expiry is None else str(int(snap.seconds_to_expiry)),
@@ -514,23 +496,23 @@ async def _buy_opposite_to_flat(
         return {
             "dry_run": True,
             "ticker": snap.ticker,
-            "action": "buy",
-            "side": opposite_side,
+            "action": "sell",
+            "side": held_side,
             "count": int(close_qty),
-            "price": int(ask_cents),
-            "flatten_method": "buy_opposite",
+            "price": int(bid_cents),
+            "flatten_method": "sell",
         }
 
     client_order_id = str(uuid.uuid4())
-    if opposite_side == "YES":
+    if held_side == "YES":
         try:
             return await client.create_order(
                 ticker=snap.ticker,
                 side="yes",
-                action="buy",
+                action="sell",
                 count=int(close_qty),
                 order_type="limit",
-                yes_price=int(ask_cents),
+                yes_price=int(bid_cents),
                 client_order_id=client_order_id,
                 time_in_force=time_in_force,
             )
@@ -543,10 +525,10 @@ async def _buy_opposite_to_flat(
         return await client.create_order(
             ticker=snap.ticker,
             side="no",
-            action="buy",
+            action="sell",
             count=int(close_qty),
             order_type="limit",
-            no_price=int(ask_cents),
+            no_price=int(bid_cents),
             client_order_id=client_order_id,
             time_in_force=time_in_force,
         )
@@ -636,18 +618,6 @@ async def place_order(
     dead_zone: float = 0.05,
     exit_delta: float = 0.09,
     catastrophic_exit_delta: float = 0.20,
-    monotonicity_guard_enabled: bool = True,
-    monotonicity_tte_threshold: int = 360,
-    monotonicity_market_confidence: float = 0.80,
-    monotonicity_model_diff: float = 0.05,
-    monotonicity_extreme_confidence: float = 0.85,
-    monotonicity_diff_at_extreme: float = 0.25,
-    monotonicity_diff_at_high: float = 0.20,
-    monotonicity_late_tte_threshold: int = 480,
-    monotonicity_late_tte_buffer: float = 0.05,
-    trend_veto_enabled: bool = True,
-    trend_veto_market_confidence: float = 0.75,
-    trend_veto_model_disagreement: float = 0.20,
     allow_reentry_after_flatten: bool = False,
     flatten_tier_enabled: bool = True,
     flatten_tier_seconds: int = 30,
@@ -1012,8 +982,8 @@ async def place_order(
                         log.warning("FLATTEN_SKIP %s flatten_qty=%d", snap.ticker, int(flatten_qty))
                         return None
 
-                    # Execute flatten by buying opposite side (lower fees!)
-                    resp = await _buy_opposite_to_flat(
+                    # Execute flatten by selling the held position
+                    resp = await _sell_to_flat(
                         client=client,
                         snap=snap,
                         held_side=held,
@@ -1052,9 +1022,6 @@ async def place_order(
                         # Full flatten complete (either tier 2 or tiering disabled)
                         _clear_partial_flatten(snap=snap)
 
-                    if bool(allow_reentry_after_flatten):
-                        _arm_pending_flip_reentry(snap=snap, from_side=held, to_side=side)
-
                     if dry_run:
                         # Simulate flatten for subsequent checks.
                         did_flatten = True
@@ -1066,6 +1033,9 @@ async def place_order(
                         # Default policy blocks re-entry; optional config allows re-entry after a flip.
                         if not bool(allow_reentry_after_flatten):
                             _mark_no_reentry_until_expiry(snap=snap)
+                        else:
+                            # Only arm re-entry after position is fully flattened
+                            _arm_pending_flip_reentry(snap=snap, from_side=held, to_side=side)
                         base_total_abs_contracts = int(
                             inv_for_flip.total_abs_contracts
                             - (ti.abs_contracts if ti is not None else abs(cur_pos))
@@ -1089,6 +1059,9 @@ async def place_order(
                         # Default policy blocks re-entry; optional config allows re-entry after a flip.
                         if not bool(allow_reentry_after_flatten):
                             _mark_no_reentry_until_expiry(snap=snap)
+                        else:
+                            # Only arm re-entry after confirming position is fully flattened
+                            _arm_pending_flip_reentry(snap=snap, from_side=held, to_side=side)
                         base_total_abs_contracts = int(inv2.total_abs_contracts)
                         base_total_exposure_usd = float(inv2.total_exposure_usd)
 
@@ -1244,188 +1217,6 @@ async def place_order(
             },
         )
         return None
-
-    # Monotonicity guard: Block trades in late markets when market is already very confident
-    # and model agrees with market. This prevents microstructure noise from triggering trades
-    # when both model and market already indicate a near-certain outcome.
-    if bool(monotonicity_guard_enabled) and (not did_flatten or allow_entry_post_flatten):
-        tte_mono = snap.seconds_to_expiry if snap.seconds_to_expiry is not None else 9999
-        market_p_yes = edge.market_p_yes if edge.market_p_yes is not None else 0.5
-        market_p_no = edge.market_p_no if edge.market_p_no is not None else 0.5
-        p_model = edge.p_yes if edge.p_yes is not None else 0.5
-
-        # Check if market is confident in either direction
-        market_confident_yes = float(market_p_yes) >= float(monotonicity_market_confidence)
-        market_confident_no = float(market_p_no) >= float(monotonicity_market_confidence)
-
-        # Model agreement: model is close to market price
-        if market_confident_yes:
-            model_diff = abs(float(p_model) - float(market_p_yes))
-        elif market_confident_no:
-            model_diff = abs((1.0 - float(p_model)) - float(market_p_no))
-        else:
-            model_diff = 1.0  # No confidence threshold met, won't block
-
-        # Piecewise threshold: require larger diff at extreme market confidence
-        # This blocks "market 75-85%, model 60-72%" fades more aggressively
-        confident_p = float(market_p_yes) if market_confident_yes else float(market_p_no)
-        if confident_p >= float(monotonicity_extreme_confidence):
-            required_diff = float(monotonicity_diff_at_extreme)
-        elif confident_p >= float(monotonicity_market_confidence):
-            required_diff = float(monotonicity_diff_at_high)
-        else:
-            required_diff = float(monotonicity_model_diff)
-        
-        # Add extra buffer when TTE < late threshold (more noise near expiry)
-        if int(tte_mono) < int(monotonicity_late_tte_threshold):
-            required_diff += float(monotonicity_late_tte_buffer)
-
-        should_block_monotonicity = (
-            int(tte_mono) < int(monotonicity_tte_threshold)
-            and (market_confident_yes or market_confident_no)
-            and float(model_diff) < required_diff
-        )
-
-        if should_block_monotonicity:
-            confident_side = "YES" if market_confident_yes else "NO"
-            log.info(
-                "MONOTONICITY_BLOCK %s side=%s tte=%ds market_p_%s=%.2f p_model=%.2f diff=%.4f < threshold=%.4f",
-                snap.ticker,
-                side,
-                int(tte_mono),
-                confident_side.lower(),
-                confident_p,
-                float(p_model),
-                float(model_diff),
-                required_diff,
-            )
-            log.info(
-                "ORDER_BLOCK %s side=%s reason_block=monotonicity_guard",
-                snap.ticker,
-                str(side),
-                extra={
-                    "csv_fields": {
-                        "run_id": run_id or "",
-                        "poll_id": poll_id if poll_id is not None else "",
-                        "ticker": snap.ticker,
-                        "side": str(side),
-                        "reason": "monotonicity_guard",
-                        "tte_s": int(tte_mono),
-                        "market_p_yes": float(market_p_yes),
-                        "market_p_no": float(market_p_no),
-                        "p_model": float(p_model),
-                        "model_diff": float(model_diff),
-                        "required_diff": required_diff,
-                    }
-                },
-            )
-            return None
-
-    # Trend alignment veto: block entries that fade strong market consensus
-    # when spot/strike relationship and recent trend align with that consensus.
-    # This prevents fading strong directional moves unless model strongly disagrees.
-    if bool(trend_veto_enabled) and (not did_flatten or allow_entry_post_flatten):
-        market_p_yes_tv = edge.market_p_yes if edge.market_p_yes is not None else 0.5
-        market_p_no_tv = edge.market_p_no if edge.market_p_no is not None else 0.5
-        p_model_tv = edge.p_yes if edge.p_yes is not None else 0.5
-        spot_tv = snap.btc_spot_usd
-        strike_tv = snap.price_to_beat
-        cb_mid_tv = snap.coinbase_mid_usd
-        vwap_tv = snap.coinbase_vwap_60s
-
-        should_veto = False
-        veto_direction: str | None = None
-        model_disagreement: float = 0.0
-        confident_p: float = 0.0
-
-        # Case 1: Block NO entries when market confident YES + uptrend + spot > strike
-        if side == "NO":
-            market_confident_yes = float(market_p_yes_tv) >= float(trend_veto_market_confidence)
-            spot_above_strike = (
-                spot_tv is not None and strike_tv is not None
-                and float(spot_tv) > float(strike_tv)
-            )
-            trend_positive = (
-                cb_mid_tv is not None and vwap_tv is not None
-                and float(cb_mid_tv) > float(vwap_tv)
-            )
-            # Model disagreement: model thinks NO is more likely than market implies
-            model_disagreement = float(market_p_yes_tv) - float(p_model_tv)
-            strong_disagreement = float(model_disagreement) >= float(trend_veto_model_disagreement)
-            confident_p = float(market_p_yes_tv)
-
-            should_veto = (
-                market_confident_yes
-                and spot_above_strike
-                and trend_positive
-                and not strong_disagreement
-            )
-            if should_veto:
-                veto_direction = "NO_in_uptrend"
-
-        # Case 2: Block YES entries when market confident NO + downtrend + spot < strike
-        elif side == "YES":
-            market_confident_no = float(market_p_no_tv) >= float(trend_veto_market_confidence)
-            spot_below_strike = (
-                spot_tv is not None and strike_tv is not None
-                and float(spot_tv) < float(strike_tv)
-            )
-            trend_negative = (
-                cb_mid_tv is not None and vwap_tv is not None
-                and float(cb_mid_tv) < float(vwap_tv)
-            )
-            # Model disagreement: model thinks YES is more likely than market implies
-            model_disagreement = float(p_model_tv) - float(market_p_yes_tv)
-            strong_disagreement = float(model_disagreement) >= float(trend_veto_model_disagreement)
-            confident_p = float(market_p_no_tv)
-
-            should_veto = (
-                market_confident_no
-                and spot_below_strike
-                and trend_negative
-                and not strong_disagreement
-            )
-            if should_veto:
-                veto_direction = "YES_in_downtrend"
-
-        if should_veto:
-            log.info(
-                "TREND_VETO_BLOCK %s side=%s reason=%s market_p_yes=%.2f market_p_no=%.2f p_model=%.2f spot=%s strike=%s cb_mid=%s vwap=%s disagreement=%.3f",
-                snap.ticker,
-                side,
-                veto_direction,
-                float(market_p_yes_tv),
-                float(market_p_no_tv),
-                float(p_model_tv),
-                _fmt_usd(spot_tv),
-                _fmt_usd(strike_tv),
-                _fmt_usd(cb_mid_tv),
-                _fmt_usd(vwap_tv),
-                float(model_disagreement),
-            )
-            log.info(
-                "ORDER_BLOCK %s side=%s reason_block=trend_veto",
-                snap.ticker,
-                str(side),
-                extra={
-                    "csv_fields": {
-                        "run_id": run_id or "",
-                        "poll_id": poll_id if poll_id is not None else "",
-                        "ticker": snap.ticker,
-                        "side": str(side),
-                        "reason": f"trend_veto:{veto_direction}",
-                        "market_p_yes": float(market_p_yes_tv),
-                        "market_p_no": float(market_p_no_tv),
-                        "p_model": float(p_model_tv),
-                        "spot_usd": spot_tv,
-                        "strike_usd": strike_tv,
-                        "cb_mid": cb_mid_tv,
-                        "vwap_60s": vwap_tv,
-                        "model_disagreement": float(model_disagreement),
-                    }
-                },
-            )
-            return None
 
     # Time gate: optionally block trades that are "too early" in the market window.
     # Applies to opening/adding, not to flattening.

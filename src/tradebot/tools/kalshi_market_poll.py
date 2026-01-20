@@ -402,24 +402,18 @@ async def pick_active_markets(
     Note: KXBTC15M markets have status="active" when tradeable, but the API
     status filter only accepts "open", "closed", "settled". We query without
     status filter and filter client-side for tradeable statuses.
+    
+    Note: Kalshi ticker dates use ET (US Eastern), not UTC. A market at 7:30 PM ET
+    on Jan 19 has ticker "26JAN19" but close_time of 00:30 UTC Jan 20.
+    We filter by close_time, not by ticker date prefix.
     """
     now = _utcnow()
     horizon = dt.timedelta(minutes=int(horizon_minutes))
 
     series_ticker = f"KX{asset.upper()}15M"
-    
-    # Kalshi uses US Eastern Time for ticker dates, not UTC
-    try:
-        import zoneinfo
-        et_tz = zoneinfo.ZoneInfo("America/New_York")
-    except Exception:
-        # Fallback: approximate ET as UTC-5
-        et_tz = dt.timezone(dt.timedelta(hours=-5))
-    
-    now_et = now.astimezone(et_tz)
-    today_prefix = f"{series_ticker}-{now_et.strftime('%y%b%d').upper()}"
 
-    # Query all markets for this series - we'll filter by time client-side
+    # Query all markets for this series - we'll filter by close_time, not ticker date
+    # (Kalshi tickers use ET date, but close_time is in UTC)
     page = await client.get_markets_page(
         limit=200,  # Get more to find current ones
         series_ticker=series_ticker,
@@ -428,11 +422,10 @@ async def pick_active_markets(
 
     all_markets = list(page.get("markets", []) or [])
     
-    # Filter to only today's markets first (alphabetical sort from API puts wrong dates first)
-    todays_markets = [m for m in all_markets if str(m.get("ticker", "")).upper().startswith(today_prefix)]
-    
-    # Accept any status - we'll filter by time
-    markets = todays_markets if todays_markets else all_markets
+    # Filter by close_time (UTC), not ticker date prefix
+    # Only include markets with status that allows trading
+    tradeable_statuses = {"active", "open"}
+    markets = [m for m in all_markets if str(m.get("status", "")).lower() in tradeable_statuses]
 
     valid: list[tuple[dt.datetime, dict[str, Any]]] = []
     for m in markets:

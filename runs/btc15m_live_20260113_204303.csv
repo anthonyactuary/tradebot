@@ -1,9 +1,0 @@
-ts_utc_iso,ts_epoch,level,logger,message,exception
-2026-01-13T20:43:03.225152+00:00,1768336983.225152,INFO,__main__,CSV_LOG enabled path=runs\btc15m_live_20260113_204303.csv,
-2026-01-13T20:43:06.262821+00:00,1768336986.262821,INFO,__main__,BALANCE available=$46.55 portfolio_value=$0.00,
-2026-01-13T20:43:06.312812+00:00,1768336986.312812,INFO,__main__,20:43:05Z  KXBTC15M-26JAN131545-45  tte=1m54s  spot=$94237.98  strike=$94333.44  fee_mode=taker  fee/c=$0.0100  p_up=0.15%  mkt=5.00%  EV_yes=-5.85%  EV_no=1.85%  decision=NO  kelly=9.49%  qty=4,
-2026-01-13T20:43:06.313072+00:00,1768336986.313072,INFO,tradebot.tools.order_execution,ENTRY_BLOCK KXBTC15M-26JAN131545-45 side=NO ev_after_fees=0.0185 <= min_entry_edge=0.0250,
-2026-01-13T20:43:12.262334+00:00,1768336992.262334,INFO,__main__,BALANCE available=$46.55 portfolio_value=$0.00,
-2026-01-13T20:43:12.319015+00:00,1768336992.319015,INFO,__main__,20:43:11Z  KXBTC15M-26JAN131545-45  tte=1m48s  spot=$94243.22  strike=$94333.44  fee_mode=taker  fee/c=$0.0100  p_up=0.20%  mkt=5.00%  EV_yes=-5.80%  EV_no=0.80%  decision=NO  kelly=8.99%  qty=4,
-2026-01-13T20:43:12.319241+00:00,1768336992.319241,INFO,tradebot.tools.order_execution,ENTRY_BLOCK KXBTC15M-26JAN131545-45 side=NO ev_after_fees=0.0080 <= min_entry_edge=0.0250,
-2026-01-13T20:43:14.905546+00:00,1768336994.905546,INFO,__main__,Stopped,

@@ -1,5 +1,0 @@
-ts_utc_iso,ts_epoch,level,logger,message,exception
-2026-01-14T02:12:47.068231+00:00,1768356767.068231,INFO,__main__,CSV_LOG enabled path=runs\btc15m_live_20260114_021247.csv,
-2026-01-14T02:12:50.169756+00:00,1768356770.169756,INFO,__main__,BALANCE available=$45.98 portfolio_value=$0.00,
-2026-01-14T02:12:50.225021+00:00,1768356770.225021,INFO,__main__,02:12:49Z  KXBTC15M-26JAN132115-15  tte=2m10s  spot=$95422.00  strike=$95273.33  fee_mode=taker  fee/c=-  p_up=98.23%  mkt=99.00%  EV_yes=-1.77%  EV_no=-1.23%  decision=-  kelly=-  qty=-,
-2026-01-14T02:12:51.452949+00:00,1768356771.452949,INFO,__main__,Stopped,

@@ -1,2 +1,0 @@
-ts_utc_iso,ts_epoch,level,logger,message,exception
-2026-01-13T20:42:39.584056+00:00,1768336959.584056,INFO,__main__,CSV_LOG enabled path=runs\btc15m_live_20260113_204239.csv,

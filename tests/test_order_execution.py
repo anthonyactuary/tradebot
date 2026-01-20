@@ -5,7 +5,7 @@ Tests cover:
 - Position sizing (Kelly)
 - Flatten logic (buy opposite side)
 - Tiered flatten state management
-- Entry gates (deadzone, min_entry_edge, monotonicity guard)
+- Entry gates (deadzone, min_entry_edge)
 - Risk limits
 """
 
@@ -552,77 +552,6 @@ class TestMinEntryEdgeGate:
             else min_entry_edge
         )
         assert effective == 0.025
-
-
-class TestMonotonicityGuard:
-    """Tests for monotonicity guard logic."""
-
-    def test_blocks_late_confident_agreeing(self) -> None:
-        """Should block when late market, confident, and model agrees."""
-        tte = 300  # 5 minutes
-        monotonicity_tte_threshold = 360  # 6 minutes
-        market_p_yes = 0.85
-        monotonicity_market_confidence = 0.80
-        p_model = 0.83
-        monotonicity_model_diff = 0.05
-
-        # Check conditions
-        is_late = tte < monotonicity_tte_threshold
-        market_confident_yes = market_p_yes >= monotonicity_market_confidence
-        model_diff = abs(p_model - market_p_yes)
-        model_agrees = model_diff < monotonicity_model_diff
-
-        assert is_late
-        assert market_confident_yes
-        assert model_agrees
-        assert abs(model_diff - 0.02) < 1e-9
-
-        # All conditions met -> should block
-        should_block = is_late and market_confident_yes and model_agrees
-        assert should_block
-
-    def test_allows_late_confident_disagreeing(self) -> None:
-        """Should allow when model disagrees with confident market."""
-        tte = 300  # 5 minutes
-        monotonicity_tte_threshold = 360  # 6 minutes
-        market_p_yes = 0.85
-        monotonicity_market_confidence = 0.80
-        p_model = 0.70  # Model disagrees!
-        monotonicity_model_diff = 0.05
-
-        is_late = tte < monotonicity_tte_threshold
-        market_confident_yes = market_p_yes >= monotonicity_market_confidence
-        model_diff = abs(p_model - market_p_yes)
-        model_agrees = model_diff < monotonicity_model_diff
-
-        assert is_late
-        assert market_confident_yes
-        assert not model_agrees  # Model disagrees
-        assert abs(model_diff - 0.15) < 1e-9
-
-        should_block = is_late and market_confident_yes and model_agrees
-        assert not should_block
-
-    def test_allows_early_market(self) -> None:
-        """Should allow in early markets even if confident and agreeing."""
-        tte = 600  # 10 minutes
-        monotonicity_tte_threshold = 360  # 6 minutes
-        market_p_yes = 0.85
-        monotonicity_market_confidence = 0.80
-        p_model = 0.84
-        monotonicity_model_diff = 0.05
-
-        is_late = tte < monotonicity_tte_threshold
-        market_confident_yes = market_p_yes >= monotonicity_market_confidence
-        model_diff = abs(p_model - market_p_yes)
-        model_agrees = model_diff < monotonicity_model_diff
-
-        assert not is_late  # Not late
-        assert market_confident_yes
-        assert model_agrees
-
-        should_block = is_late and market_confident_yes and model_agrees
-        assert not should_block
 
 
 class TestFlipExitDelta:

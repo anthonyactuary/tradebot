@@ -200,6 +200,14 @@ class KalshiClient:
             "GET", "/trade-api/v2/search/tags_by_categories", auth_required=False
         )
 
+    async def get_market(self, ticker: str) -> Json:
+        """Get a single market by ticker. Returns market data including BBO."""
+        return await self.request(
+            "GET",
+            f"/trade-api/v2/markets/{ticker}",
+            auth_required=False,
+        )
+
     async def get_orderbook(self, ticker: str) -> Json:
         return await self.request(
             "GET",

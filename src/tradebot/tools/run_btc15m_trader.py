@@ -63,7 +63,7 @@ FeeMode = Literal["maker", "taker"]
 @dataclass(frozen=True)
 class TraderConfig:
     # Model
-    model_dir: str = "src/tradebot/data/btc15m_model_coinbase_83d_purged30"
+    model_dir: str = "src/tradebot/data/btc15m_model_coinbase_80d_purged30"
 
     # Polling
     live: bool = True
@@ -117,26 +117,6 @@ class TraderConfig:
     dead_zone: float = 0.05
     exit_delta: float = 0.10
     catastrophic_exit_delta: float = 0.18
-
-    # Monotonicity guard: blocks trades in late markets when market is very confident
-    # and model agrees with market (avoids microstructure noise near expiry)
-    monotonicity_guard_enabled: bool = True
-    monotonicity_tte_threshold: int = 840  # seconds; block if TTE < this AND confident
-    monotonicity_market_confidence: float = 0.80  # market_p >= this to trigger (tier 1)
-    monotonicity_model_diff: float = 0.10  # required diff below tier 1 confidence
-    # Piecewise thresholds: require larger diff at extreme market confidence
-    monotonicity_extreme_confidence: float = 0.85  # tier 2 threshold
-    monotonicity_diff_at_extreme: float = 0.25  # required diff when market_p >= 0.85
-    monotonicity_diff_at_high: float = 0.20  # required diff when market_p >= 0.80
-    monotonicity_late_tte_threshold: int = 480  # 8 min; add extra buffer below this
-    monotonicity_late_tte_buffer: float = 0.05  # extra diff added when TTE < late threshold
-
-    # Trend alignment veto: blocks NO entries when market is confident YES,
-    # spot is above strike (in the money), and recent trend is positive.
-    # Prevents fading strong YES consensus during uptrends.
-    trend_veto_enabled: bool = True
-    trend_veto_market_confidence: float = 0.75  # market_p_yes >= this to consider veto
-    trend_veto_model_disagreement: float = 0.20  # bypass veto if model disagrees by this much
 
     # Data sanity
     # Block entry orders if Kalshi strike is too far from external spot (helps when
@@ -336,18 +316,6 @@ async def _run_once(
                 dead_zone=float(cfg.dead_zone),
                 exit_delta=float(cfg.exit_delta),
                 catastrophic_exit_delta=float(cfg.catastrophic_exit_delta),
-                monotonicity_guard_enabled=bool(cfg.monotonicity_guard_enabled),
-                monotonicity_tte_threshold=int(cfg.monotonicity_tte_threshold),
-                monotonicity_market_confidence=float(cfg.monotonicity_market_confidence),
-                monotonicity_model_diff=float(cfg.monotonicity_model_diff),
-                monotonicity_extreme_confidence=float(cfg.monotonicity_extreme_confidence),
-                monotonicity_diff_at_extreme=float(cfg.monotonicity_diff_at_extreme),
-                monotonicity_diff_at_high=float(cfg.monotonicity_diff_at_high),
-                monotonicity_late_tte_threshold=int(cfg.monotonicity_late_tte_threshold),
-                monotonicity_late_tte_buffer=float(cfg.monotonicity_late_tte_buffer),
-                trend_veto_enabled=bool(cfg.trend_veto_enabled),
-                trend_veto_market_confidence=float(cfg.trend_veto_market_confidence),
-                trend_veto_model_disagreement=float(cfg.trend_veto_model_disagreement),
                 allow_reentry_after_flatten=bool(cfg.allow_reentry_after_flatten),
                 flatten_tier_enabled=bool(cfg.flatten_tier_enabled),
                 flatten_tier_seconds=int(cfg.flatten_tier_seconds),
