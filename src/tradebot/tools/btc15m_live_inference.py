@@ -128,6 +128,26 @@ def load_model(model_dir: str) -> tuple[Any, list[str]]:
     return _load_model(model_dir)
 
 
+def load_lstm_model(model_dir: str) -> tuple[Any, dict[str, Any]]:
+    """Load LSTM model + meta (feature_names, feat_mean/std, seq_len)."""
+    meta_path = f"{model_dir}/meta.json".replace("\\", "/")
+    model_path = f"{model_dir}/model.pt".replace("\\", "/")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    try:
+        import torch  # type: ignore
+
+        state = torch.load(model_path, map_location="cpu")
+        return state, meta
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load LSTM model from {model_path}. "
+            "Ensure torch is installed and the model dir is correct."
+        ) from e
+
+
 def _require_numpy_pandas() -> tuple[Any, Any]:
     try:
         import numpy as np  # type: ignore
@@ -263,6 +283,160 @@ def build_feature_dict(
         "time_remaining": float(time_remaining),
     }
     return feats
+
+
+def build_lstm_sequence(
+    *,
+    price_to_beat: float,
+    seconds_to_expiry: int,
+    recent_closes_1m: list[float],
+    seq_len: int,
+) -> list[list[float]]:
+    """Build LSTM feature sequence (oldest->newest) from recent closes.
+
+    Requires at least seq_len + 5 closes for returns/vol/trend.
+    """
+    K = float(price_to_beat)
+    if not (K > 0 and math.isfinite(K)):
+        raise ValueError("Invalid price_to_beat")
+
+    closes = [float(x) for x in recent_closes_1m]
+    need = int(seq_len) + 5
+    if len(closes) < need:
+        raise ValueError(f"Need >= {need} recent closes for LSTM sequence")
+
+    # Use the most recent window for the sequence.
+    closes = closes[-(int(seq_len) + 5) :]
+
+    def _r(idx: int, k: int) -> float:
+        prev = closes[idx - k]
+        cur = closes[idx]
+        if prev <= 0:
+            return 0.0
+        return (cur / prev) - 1.0
+
+    seq: list[list[float]] = []
+    tte_now_min = float(seconds_to_expiry) / 60.0
+    seq_len_i = int(seq_len)
+
+    # Indices for the last seq_len points in closes (offset by 5 for lookback).
+    start_idx = 5
+    for j in range(seq_len_i):
+        idx = start_idx + j
+        S = closes[idx]
+        if not (S > 0 and math.isfinite(S)):
+            raise ValueError("Invalid close in sequence")
+
+        delta = (S - K) / K
+        abs_delta = abs(delta)
+        return_1m = _r(idx, 1)
+        return_3m = _r(idx, 3)
+        return_5m = _r(idx, 5)
+
+        rets = []
+        for t in range(idx - 4, idx + 1):
+            rets.append(_r(t, 1))
+        vol_5m = float(_np_std(rets))
+
+        closes_5 = closes[idx - 4 : idx + 1]
+        trend_5m = float(_trend_slope_last5([float(x) for x in closes_5]))
+
+        # Older steps have higher time_remaining.
+        time_remaining = tte_now_min + float(seq_len_i - 1 - j)
+
+        seq.append(
+            [
+                float(delta),
+                float(abs_delta),
+                float(return_1m),
+                float(return_3m),
+                float(return_5m),
+                float(vol_5m),
+                float(trend_5m),
+                float(time_remaining),
+            ]
+        )
+
+    return seq
+
+
+def _np_std(values: list[float]) -> float:
+    np, _pd = _require_numpy_pandas()
+    return float(np.std(np.asarray(values, dtype=float), ddof=0))
+
+
+def predict_probability_lstm(
+    *,
+    state_dict: Any,
+    meta: dict[str, Any],
+    sequence: list[list[float]],
+) -> float:
+    import torch  # type: ignore
+
+    seq_len = int(meta.get("train", {}).get("seq_len", meta.get("seq_len", 10)) or 10)
+    feat_mean = meta.get("train", {}).get("feat_mean") or meta.get("feat_mean")
+    feat_std = meta.get("train", {}).get("feat_std") or meta.get("feat_std")
+    if feat_mean is None or feat_std is None:
+        raise ValueError("Missing feat_mean/feat_std in LSTM meta.json")
+
+    import numpy as np  # type: ignore
+
+    x = np.asarray(sequence, dtype=float)
+    if x.shape[0] != seq_len:
+        raise ValueError(f"Sequence length {x.shape[0]} != expected {seq_len}")
+
+    feat_mean_arr = np.asarray(feat_mean, dtype=float)
+    feat_std_arr = np.asarray(feat_std, dtype=float)
+    x = (x - feat_mean_arr) / (feat_std_arr + 1e-8)
+
+    x_t = torch.tensor(x[None, :, :], dtype=torch.float32)
+
+    hidden_size = int(meta.get("train", {}).get("hidden_size", 64) or 64)
+    num_layers = int(meta.get("train", {}).get("num_layers", 2) or 2)
+    dropout = float(meta.get("train", {}).get("dropout", 0.2) or 0.2)
+
+    model = _build_lstm_model(input_size=x.shape[1], hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    with torch.no_grad():
+        logits = model(x_t)
+        p = torch.sigmoid(logits).cpu().numpy()[0]
+    return float(p)
+
+
+def _build_lstm_model(
+    *,
+    input_size: int,
+    hidden_size: int,
+    num_layers: int,
+    dropout: float,
+) -> Any:
+    import torch.nn as nn  # type: ignore
+
+    class _LSTM(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0,
+            )
+            self.fc = nn.Sequential(
+                nn.Linear(hidden_size, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+            )
+
+        def forward(self, x: Any) -> Any:
+            out, _ = self.lstm(x)
+            last = out[:, -1, :]
+            return self.fc(last).squeeze(-1)
+
+    return _LSTM()
 
 
 def predict_probability(model: Any, feature_names: list[str], features: dict[str, float]) -> float:

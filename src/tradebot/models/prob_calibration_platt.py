@@ -146,10 +146,19 @@ class MultiTTECalibrator:
     _buckets: list[int] = field(default_factory=list)
     
     @classmethod
-    def train_from_csvs(cls, csv_dir: str | Path, verbose: bool = True) -> "MultiTTECalibrator":
-        """Train calibrators from all CSV files in directory.
+    def train_from_csvs(
+        cls,
+        csv_dir: str | Path,
+        *,
+        model_name: str | None = None,
+        verbose: bool = True,
+    ) -> "MultiTTECalibrator":
+        """Train calibrators from CSV files in directory.
         
-        Expects files named: platt_training_data_{max}_{min}_tte.csv
+        Supported file names:
+        - platt_training_data_{max}_{min}_tte.csv
+        - platt_training_data_{model}_{max}_{min}_tte.csv
+        
         Each CSV should have columns: ticker, p_yes, y
         """
         import pandas as pd
@@ -158,12 +167,27 @@ class MultiTTECalibrator:
         calibrators = {}
         
         for f in sorted(csv_dir.glob("platt_training_data_*_tte.csv")):
-            # Parse TTE range from filename
-            parts = f.stem.replace("platt_training_data_", "").replace("_tte", "").split("_")
-            tte_max = int(parts[0])
+            stem = f.stem.replace("platt_training_data_", "").replace("_tte", "")
+            parts = stem.split("_")
+
+            model_in_name: str | None = None
+            if len(parts) == 2:
+                # Legacy: {max}_{min}
+                tte_max = int(parts[0])
+            elif len(parts) >= 3:
+                # New: {model}_{max}_{min}
+                model_in_name = str(parts[0])
+                tte_max = int(parts[1])
+            else:
+                continue
+
+            if model_name is not None and model_in_name not in (None, model_name):
+                continue
             
             # Load and train
             df = pd.read_csv(f)
+            # Drop rows with missing p_yes or y
+            df = df.dropna(subset=["p_yes", "y"]) 
             cal = PlattCalibrator()
             cal.fit(df["p_yes"].values, df["y"].values)
             calibrators[tte_max] = (cal.a, cal.b)

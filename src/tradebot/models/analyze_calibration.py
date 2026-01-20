@@ -19,7 +19,6 @@ import pandas as pd
 
 # Paths
 MODELS_DIR = Path(__file__).parent
-CAL_FILE = MODELS_DIR / "platt_multi_tte.json"
 CSV_DIR = MODELS_DIR / "calibration_training"
 
 
@@ -65,9 +64,28 @@ def reliability_table(p_raw: np.ndarray, p_cal: np.ndarray, y: np.ndarray, bins:
             print(f"  [{lo:.1f}-{hi:.1f})    {count:>6} {avg_raw:>8.3f} {avg_cal:>8.3f} {actual:>8.3f} {err_raw:>8.3f} {err_cal:>8.3f}")
 
 
-def main():
+def _parse_tte_max(path: Path) -> int:
+    stem = path.stem.replace("platt_training_data_", "").replace("_tte", "")
+    parts = stem.split("_")
+    if len(parts) == 2:
+        return int(parts[0])
+    if len(parts) >= 3:
+        return int(parts[1])
+    raise ValueError(f"Unrecognized training file name: {path.name}")
+
+
+def _parse_model_name(path: Path) -> str | None:
+    stem = path.stem.replace("platt_training_data_", "").replace("_tte", "")
+    parts = stem.split("_")
+    if len(parts) >= 3:
+        return str(parts[0])
+    return None
+
+
+def main(*, model_name: str = "xgb80"):
     # Load calibrator
-    with open(CAL_FILE) as f:
+    cal_file = MODELS_DIR / f"platt_multi_tte_{model_name}.json"
+    with open(cal_file) as f:
         cal_data = json.load(f)
     calibrators = {int(k): (v["a"], v["b"]) for k, v in cal_data["calibrators"].items()}
     
@@ -81,16 +99,21 @@ def main():
     all_p_raw, all_p_cal, all_y = [], [], []
     
     # Sort by TTE descending
-    csv_files = sorted(
-        CSV_DIR.glob("platt_training_data_*_tte.csv"),
-        key=lambda x: -int(x.stem.split("_")[3])
-    )
+    all_files = list(CSV_DIR.glob("platt_training_data_*_tte.csv"))
+    model_files = [f for f in all_files if _parse_model_name(f) == model_name]
+    legacy_files = [f for f in all_files if _parse_model_name(f) is None]
+
+    # Prefer model-specific files if present, otherwise fall back to legacy.
+    csv_files = model_files if model_files else legacy_files
+    csv_files = sorted(csv_files, key=lambda x: -_parse_tte_max(x))
     
     for f in csv_files:
-        parts = f.stem.replace("platt_training_data_", "").replace("_tte", "").split("_")
-        tte_max = int(parts[0])
+        tte_max = _parse_tte_max(f)
         
         df = pd.read_csv(f)
+        df = df.dropna(subset=["p_yes", "y"]).copy()
+        if len(df) == 0:
+            continue
         p_raw = df["p_yes"].values
         y = df["y"].values
         a, b = calibrators[tte_max]

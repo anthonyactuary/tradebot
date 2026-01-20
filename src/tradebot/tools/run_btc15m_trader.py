@@ -47,7 +47,15 @@ if (_SRC_ROOT / "tradebot").is_dir():
 
 from tradebot.config import Settings
 from tradebot.kalshi.client import KalshiClient
-from tradebot.tools.btc15m_live_inference import fetch_recent_1m_closes, load_model
+from tradebot.tools.btc15m_live_inference import (
+    fetch_recent_1m_closes,
+    load_model,
+    load_lstm_model,
+    build_feature_dict,
+    predict_probability,
+    build_lstm_sequence,
+    predict_probability_lstm,
+)
 from tradebot.tools.btc15m_trade_signal import TradeSignal, _to_pretty_line, signal_for_snapshot
 from tradebot.tools.inventory_check import fetch_inventory_summary
 from tradebot.tools.csv_logging import default_live_csv_log_path, install_csv_log_handler
@@ -64,6 +72,8 @@ FeeMode = Literal["maker", "taker"]
 class TraderConfig:
     # Model
     model_dir: str = "src/tradebot/data/btc15m_model_coinbase_80d_purged30"
+    model_dir_xgb_180: str = "src/tradebot/data/btc15m_model_coinbase_180d_purged30"
+    model_dir_lstm: str = "src/tradebot/data/btc15m_model_lstm_180d_purged30"
 
     # Polling
     live: bool = True
@@ -161,6 +171,10 @@ async def _run_once(
     client: KalshiClient,
     model: object,
     feature_names: list[str],
+    model_xgb_180: object | None,
+    feature_names_xgb_180: list[str] | None,
+    lstm_state: object | None,
+    lstm_meta: dict[str, object] | None,
     cfg: TraderConfig,
     run_id: str,
     poll_id: int,
@@ -183,7 +197,8 @@ async def _run_once(
         return
 
     # One Coinbase call per poll (not per market)
-    closes = await fetch_recent_1m_closes(limit=6)
+    # Fetch extra closes to support LSTM sequence features.
+    closes = await fetch_recent_1m_closes(limit=20)
 
     bankroll_usd: float | None = None
     if cfg.bankroll_usd is not None:
@@ -234,6 +249,41 @@ async def _run_once(
         decision_side = sig.decision.side if sig.decision is not None else None
         contracts = sig.position.contracts if (sig.position is not None and sig.position.contracts is not None) else None
         kelly_fraction = float(sig.position.kelly_fraction) if sig.position is not None else None
+        # Extra model probabilities for logging.
+        p_yes_xgb_180: float | None = None
+        p_no_xgb_180: float | None = None
+        p_yes_lstm: float | None = None
+        p_no_lstm: float | None = None
+
+        if model_xgb_180 is not None and feature_names_xgb_180 is not None:
+            try:
+                feats = build_feature_dict(
+                    price_to_beat=float(s.price_to_beat) if s.price_to_beat is not None else 0.0,
+                    btc_spot_usd=float(sig.proxy_spot_usd) if sig.proxy_spot_usd is not None else 0.0,
+                    seconds_to_expiry=int(s.seconds_to_expiry) if s.seconds_to_expiry is not None else 0,
+                    recent_closes_1m=closes,
+                )
+                p_yes_xgb_180 = float(predict_probability(model_xgb_180, feature_names_xgb_180, feats))
+                p_no_xgb_180 = float(1.0 - p_yes_xgb_180)
+            except Exception:
+                p_yes_xgb_180 = None
+                p_no_xgb_180 = None
+
+        if lstm_state is not None and lstm_meta is not None:
+            try:
+                seq_len = int((lstm_meta.get("train", {}) or {}).get("seq_len", 10) or 10)
+                seq = build_lstm_sequence(
+                    price_to_beat=float(s.price_to_beat) if s.price_to_beat is not None else 0.0,
+                    seconds_to_expiry=int(s.seconds_to_expiry) if s.seconds_to_expiry is not None else 0,
+                    recent_closes_1m=closes,
+                    seq_len=seq_len,
+                )
+                p_yes_lstm = float(predict_probability_lstm(state_dict=lstm_state, meta=lstm_meta, sequence=seq))
+                p_no_lstm = float(1.0 - p_yes_lstm)
+            except Exception:
+                p_yes_lstm = None
+                p_no_lstm = None
+
         log.info(
             "PRED_SNAPSHOT %s",
             s.ticker,
@@ -251,6 +301,10 @@ async def _run_once(
                     "tte_s": sig.seconds_to_expiry,
                     "p_yes": sig.p_yes,
                     "p_no": sig.p_no,
+                    "p_yes_xgb_180": p_yes_xgb_180,
+                    "p_no_xgb_180": p_no_xgb_180,
+                    "p_yes_lstm": p_yes_lstm,
+                    "p_no_lstm": p_no_lstm,
                     "market_p_yes": sig.market_p_yes,
                     "market_p_no": sig.market_p_no,
                     "fee_assumption": str(cfg.fee_mode),
@@ -360,12 +414,37 @@ def main() -> None:
 
     model, feature_names = load_model(str(CONFIG.model_dir))
 
+    model_xgb_180: object | None = None
+    feature_names_xgb_180: list[str] | None = None
+    try:
+        model_xgb_180, feature_names_xgb_180 = load_model(str(CONFIG.model_dir_xgb_180))
+    except Exception:
+        model_xgb_180, feature_names_xgb_180 = None, None
+
+    lstm_state: object | None = None
+    lstm_meta: dict[str, object] | None = None
+    try:
+        lstm_state, lstm_meta = load_lstm_model(str(CONFIG.model_dir_lstm))
+    except Exception:
+        lstm_state, lstm_meta = None, None
+
     async def runner() -> None:
         settings = Settings.load()
         client = KalshiClient.from_settings(settings)
         try:
             if not CONFIG.live:
-                await _run_once(client=client, model=model, feature_names=feature_names, cfg=CONFIG, run_id=str(run_id), poll_id=0)
+                await _run_once(
+                    client=client,
+                    model=model,
+                    feature_names=feature_names,
+                    model_xgb_180=model_xgb_180,
+                    feature_names_xgb_180=feature_names_xgb_180,
+                    lstm_state=lstm_state,
+                    lstm_meta=lstm_meta,
+                    cfg=CONFIG,
+                    run_id=str(run_id),
+                    poll_id=0,
+                )
                 return
 
             start = _utcnow().timestamp()
@@ -380,6 +459,10 @@ def main() -> None:
                         client=client,
                         model=model,
                         feature_names=feature_names,
+                        model_xgb_180=model_xgb_180,
+                        feature_names_xgb_180=feature_names_xgb_180,
+                        lstm_state=lstm_state,
+                        lstm_meta=lstm_meta,
                         cfg=CONFIG,
                         run_id=str(run_id),
                         poll_id=int(poll_id),

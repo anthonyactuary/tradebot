@@ -26,6 +26,8 @@ INPUT_FILES = [
     r"c:\Users\slump\Tradebot\tradebot\runs\btc15m_live_v2_20260119_045709.csv",
     r"c:\Users\slump\Tradebot\tradebot\runs\btc15m_live_v2_20260119_153247.csv",
     r"c:\Users\slump\Tradebot\tradebot\runs\btc15m_live_v2_20260119_195642.csv",
+    r"c:\Users\slump\Tradebot\tradebot\runs\btc15m_live_v2_20260120_002945.csv",
+    r"c:\Users\slump\Tradebot\tradebot\runs\btc15m_live_v2_20260120_053948.csv",
     # Add more files below:
 ]
 

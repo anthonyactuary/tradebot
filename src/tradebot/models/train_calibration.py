@@ -56,24 +56,32 @@ def main():
     from prob_calibration_platt import MultiTTECalibrator
     
     csv_dir = Path(__file__).parent / "calibration_training"
-    output_file = Path(__file__).parent / "platt_multi_tte.json"
-    
-    multi_cal = MultiTTECalibrator.train_from_csvs(csv_dir)
-    multi_cal.save(output_file)
-    print(f"\nSaved to: {output_file}")
+    model_names = ["xgb80", "xgb180", "lstm"]
+    output_files: list[Path] = []
+    for model_name in model_names:
+        output_file = Path(__file__).parent / f"platt_multi_tte_{model_name}.json"
+        multi_cal = MultiTTECalibrator.train_from_csvs(csv_dir, model_name=model_name)
+        multi_cal.save(output_file)
+        output_files.append(output_file)
+        print(f"\nSaved to: {output_file}")
     
     # Step 4: Analyze
     print("\n")
     from analyze_calibration import main as analyze_main
-    analyze_main()
+    for model_name in model_names:
+        print("\n" + "=" * 70)
+        print(f"ANALYZE CALIBRATION: {model_name}")
+        print("=" * 70)
+        analyze_main(model_name=model_name)
     
     print("\n" + "=" * 70)
     print("PIPELINE COMPLETE")
     print("=" * 70)
-    print(f"Calibrator saved to: {output_file}")
+    for out in output_files:
+        print(f"Calibrator saved to: {out}")
     print("\nUsage in your bot:")
     print("  from tradebot.models.prob_calibration_platt import MultiTTECalibrator")
-    print("  cal = MultiTTECalibrator.load('path/to/platt_multi_tte.json')")
+    print("  cal = MultiTTECalibrator.load('path/to/platt_multi_tte_xgb80.json')")
     print("  p_calibrated = cal.predict(p_raw=0.65, tte=450)")
 
 
